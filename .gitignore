@@ -1,0 +1,9 @@
+build/
+external/
+*.dll
+*.pdb
+# Modèles téléchargés (Sketchfab, CC-BY) : convertis par tools_src/weapons3d, pas versionnés
+assets/
+tools/
+
+dist/

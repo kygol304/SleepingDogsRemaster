@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.15)
+project(SleepingDogsRemasterInstaller LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
+add_executable(installer installer.cpp)
+target_compile_options(installer PRIVATE /utf-8 /W4 /EHsc)
+set_target_properties(installer PROPERTIES OUTPUT_NAME "SleepingDogsRemaster-Installer")
