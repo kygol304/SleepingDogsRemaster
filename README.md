@@ -4,7 +4,6 @@ A mod for **Sleeping Dogs: Definitive Edition** (Steam) that modernizes the game
 GTA VI-style HUD, a GTA V / RDR2-style weapon wheel, an armory in the safehouse wardrobe, and new
 weapons with their own 3D models.
 
-Download and install: [Nexus Mods](https://www.nexusmods.com/sleepingdogsdefinitiveedition/mods/177).
 
 ## Features
 
