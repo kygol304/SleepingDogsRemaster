@@ -17,6 +17,7 @@
 #include <string>
 
 #include "newweapons.h"
+#include "graphics.h"
 
 namespace {
 
@@ -45,6 +46,28 @@ FILE* g_log = nullptr;
 #define LOG(...) do { if (g_log) { fprintf(g_log, __VA_ARGS__); fputc('\n', g_log); fflush(g_log); } } while (0)
 
 std::atomic<bool> g_running{true};
+
+// ---- Mesure du coût du mod (journal toutes les 10 s) -----------------------------------------
+// Temps passé dans chaque partie du mod, ramené à une image du jeu (une mise à jour du HUD).
+struct PerfSlot { const char* name; std::atomic<uint64_t> ticks{0}, maxTicks{0}, calls{0}; };
+PerfSlot g_perf[] = { {"HUD/armes"}, {"manette"}, {"carte (tuiles)"}, {"carte (quads)"}, {"carte (icones)"},
+                      {"dont icone HUD"}, {"dont modeles 3D"}, {"dont roue"}, {"dont graphismes"}, {"dont armes cachees"} };
+enum { kPerfHud, kPerfPad, kPerfTiles, kPerfQuad, kPerfProject, kPerfIcon, kPerfModels, kPerfWheel, kPerfGfx, kPerfHidden };
+struct PerfScope {
+    PerfSlot& slot;
+    LARGE_INTEGER t0;
+    explicit PerfScope(PerfSlot& s) : slot(s) { QueryPerformanceCounter(&t0); }
+    ~PerfScope()
+    {
+        LARGE_INTEGER t1;
+        QueryPerformanceCounter(&t1);
+        const uint64_t d = static_cast<uint64_t>(t1.QuadPart - t0.QuadPart);
+        slot.ticks += d;
+        ++slot.calls;
+        uint64_t m = slot.maxTicks.load();
+        while (d > m && !slot.maxTicks.compare_exchange_weak(m, d)) {}
+    }
+};
 uintptr_t g_base = 0;
 
 // ---- Réglages (SleepingDogsRemaster.ini) ---------------------------------------------------
@@ -126,16 +149,36 @@ void WriteDefaultIni()
           "; zoom minimum (plus grand = plus rapproche, evite les trous en voiture)\n"
           "MinZoom=1.05\n"
           "\n[Wheel]\n"
-          "; roue d'arme : RB maintenu (ou Tab), choix au stick droit\n"
+          "; roue d'arme : fleche gauche (manette) ou touche Key (clavier) maintenue, choix au stick droit / a la souris\n"
           "; ralenti pendant la roue (0.25 = 4x plus lent, 1 = pas de ralenti)\n"
           "SlowMo=0.25\n"
-          "; secondes de maintien de RB avant d'ouvrir la roue\n"
-          "HoldTime=0.5\n"
+          "; touche du clavier pour la roue (une lettre)\n"
+          "Key=C\n"
           "; icone des mains nues (Y dans la roue pour la changer)\n"
           "FistIcon=4\n"
           "\n[Loadout]\n"
           "; 1 = garder les armes de la roue d'une session a l'autre, 0 = inventaire vide au lancement\n"
           "KeepBetweenSessions=0\n"
+          "\n[Graphics]\n"
+          "; rendu : bloom = halo des lumieres (neons), 1 = jeu d'origine ; seuil plus bas = plus de lumieres qui rayonnent\n"
+          "Enabled=1\n"
+          "BloomBoost=1.15\n"
+          "NightBloomBoost=1.6\n"
+          "BloomThreshold=0.9\n"
+          "NightBloomThreshold=0.7\n"
+          "BloomSaturation=1.15\n"
+          "SkySaturation=1.1\n"
+          "SkyBoost=1.0\n"
+          "; luminosite globale (EV ajoute, 0 = origine)\n"
+          "Exposure=0.0\n"
+          "\n[Focus]\n"
+          "; focus : fleche droite (manette) ou Key (clavier) ; ralenti (vitesse du jeu), duree d'une barre pleine (s), vitesse de remplissage\n"
+          "Key=X\n"
+          "SlowMo=0.35\n"
+          "Duration=15\n"
+          "Gain=1.0\n"
+          "; barre au lancement (1 = pleine)\n"
+          "Start=1.0\n"
           "\n[Rocket]\n"
           "; lance-roquettes : vitesse, chute, degats et rayon d'explosion (x origine), roquettes par chargeur\n"
           "Speed=3.0\n"
@@ -586,6 +629,7 @@ __declspec(noinline) void __fastcall HookQuad(
     float* color, uint32_t texture, uint64_t extra,
     uint32_t alphaState, uint32_t rasterState, float* matrix)
 {
+    PerfScope perf(g_perf[kPerfQuad]);
     const uintptr_t ret = reinterpret_cast<uintptr_t>(_ReturnAddress());
     const bool minimap = ret == g_base + kMinimapRetA || ret == g_base + kMinimapRetB;
     if (!g_origQuad) return;
@@ -654,6 +698,7 @@ void ClampZoom(uint8_t* widget)
 
 __declspec(noinline) void __fastcall HookProject(float* out, float* in, float* ctx)
 {
+    PerfScope perf(g_perf[kPerfProject]);
     if (!g_origProject) return;
     const bool hudOld = ctx && fabsf(ctx[0] - g_mapOrigX) < 8.f && fabsf(ctx[1] - g_mapOrigY) < 8.f;
     const bool hudNew = ctx && fabsf(ctx[0] - g_mapOrigX - g_mapDX) < 8.f && fabsf(ctx[1] - g_mapOrigY - g_mapDY) < 8.f;
@@ -763,6 +808,7 @@ __declspec(noinline) void __fastcall HookTiles(
     void* widget, void* view, float* color,
     uint32_t alphaState, uint32_t rasterState, float* matrix)
 {
+    PerfScope perf(g_perf[kPerfTiles]);
     if (!g_origTiles) return;
     if (!g_roundMinimap.load(std::memory_order_relaxed)) {
         g_origTiles(widget, view, color, alphaState, rasterState, matrix);
@@ -1141,7 +1187,9 @@ int SlotTarget(int slot)
     }
 }
 
-uint8_t* SlotItem(uint8_t* character, int slot)
+// Objet du ciblage du personnage pour un type de cible (emplacements d'inventaire, 0x29 = objet
+// à ramasser visé).
+uint8_t* TargetItem(uint8_t* character, int type)
 {
     uint8_t* comps = CharComponents(character);
     if (!comps) return nullptr;
@@ -1150,9 +1198,14 @@ uint8_t* SlotItem(uint8_t* character, int slot)
     auto* map = *reinterpret_cast<uint8_t**>(ts + 0x60);
     auto* entries = *reinterpret_cast<uint8_t**>(ts + 0x58);
     if (!map || !entries) return nullptr;
-    const uint8_t idx = map[8 + SlotTarget(slot)];
+    const uint8_t idx = map[8 + type];
     if (idx == 0) return nullptr;
     return *reinterpret_cast<uint8_t**>(entries + idx * 0x38 + 0x28);
+}
+
+uint8_t* SlotItem(uint8_t* character, int slot)
+{
+    return TargetItem(character, SlotTarget(slot));
 }
 
 const char* ObjName(uint8_t* obj)
@@ -1189,11 +1242,14 @@ void LogSlots(const char* why)
 
 struct WeaponDef;
 WeaponDef* DefOf(uint8_t* item);
+WeaponDef* ClearStaging();
+std::string ModFile(const char* name, const char* ext);
 bool DrawInProgress();
 extern int g_handSlot;
 WeaponDef*& SlotRef(int slot);
 bool InSlots(WeaponDef* d);
 int FreeSlotFor(WeaponDef* d);
+int PickupSlotFor(WeaponDef* nd, int k);
 int g_pickupSlot = -1;   // emplacement dont hérite l'arme ramassée
 bool HolsterHand();
 const char* LabelOf(uint8_t* item);
@@ -1215,7 +1271,8 @@ __declspec(noinline) uint8_t __fastcall HookEquip(void* inv, void* item, uint64_
         int k = g_pickupSlot;
         g_pickupSlot = -1;
         if (nd && SlotItem(Player(), kSlotHand) == item) {
-            if (k < 1) k = InSlots(nd) ? -1 : FreeSlotFor(nd);
+            if (k >= 1) k = PickupSlotFor(nd, k);
+            else k = InSlots(nd) ? -1 : FreeSlotFor(nd);
             if (k >= 1) { SlotRef(k) = nd; g_handSlot = k; LOG("armes : %s ramassee -> emplacement %d", LabelOf(static_cast<uint8_t*>(item)), k); }
             else g_handSlot = -1;
         } else {
@@ -1604,8 +1661,13 @@ uint8_t* WeaponPropsOf(uint8_t* item)
 uint32_t WeaponSymbolOf(uint8_t* item)
 {
     uint8_t* comp = WeaponPropsOf(item);
-    if (!comp) return 0;
-    auto* entry = *reinterpret_cast<uint32_t**>(comp + 0xB0);
+    uint32_t* entry = comp ? *reinterpret_cast<uint32_t**>(comp + 0xB0) : nullptr;
+    // La recherche de composant échoue sur certaines armes (MGL, armes ramassées...) : accès direct
+    // par l'emplacement du composant (SDK), comme pour le lance-roquettes.
+    if (!entry) {
+        void** slot = nw::WeaponInfoSlot(item);
+        entry = slot ? static_cast<uint32_t*>(*slot) : nullptr;
+    }
     return entry ? entry[0] : 0;
 }
 
@@ -1654,6 +1716,11 @@ WeaponDef* DefOf(uint8_t* item)
     // Le cache objet -> arme n'est sûr que tant que l'objet existe : la mémoire d'une arme supprimée
     // est réutilisée pour la suivante. On revérifie donc le symbole de la fiche à chaque fois.
     const uint32_t sym0 = WeaponSymbolOf(item);
+    for (auto& d : g_defs) {
+        if (!d.model || !d.ps || (sym0 && PropSetSymbol(d) != sym0)) continue;
+        const uint32_t uid = nw::LoadedModel(ModFile(d.model, ".skm").c_str());   // sans jamais le créer ici
+        if (uid && nw::HasModel(item, uid)) { g_itemDef[item] = &d; return &d; }
+    }
     auto it = g_itemDef.find(item);
     if (it != g_itemDef.end()) {
         if (!sym0 || PropSetSymbol(*it->second) == sym0) return it->second;
@@ -1677,7 +1744,7 @@ WeaponDef* DefOf(uint8_t* item)
     static uint8_t* warnedFor = nullptr;
     if (warnedFor != item) {
         warnedFor = item;
-        LOG("armes : arme non reconnue (cle %08x)", key);
+        LOG("armes : arme non reconnue (cle %08x, objet %s, fiche %08x)", key, ObjName(item), WeaponSymbolOf(item));
     }
     return nullptr;
 }
@@ -1847,6 +1914,18 @@ int FreeSlotFor(WeaponDef* d)
     return -1;
 }
 
+// Arme ramassée en échange de l'arme tenue (lâchée, emplacement k) : elle reprend k si c'est la même
+// catégorie (ceinture 1 / armes longues 2-3, mêlée partout), sinon un emplacement de sa catégorie.
+int PickupSlotFor(WeaponDef* nd, int k)
+{
+    if (k < 1 || !nd) return k;
+    SlotRef(k) = nullptr;                       // l'arme lâchée quitte la roue
+    const bool sameKind = nd->cls == 3 || (nd->cls == 2) == (k >= 2);
+    if (sameKind) return k;
+    const int free = FreeSlotFor(nd);
+    return free >= 1 ? free : k;
+}
+
 // Range l'arme en main dans son emplacement (mains nues ensuite). Faux si impossible.
 bool HolsterHand()
 {
@@ -1883,6 +1962,7 @@ bool HolsterHand()
 enum class DrawStep { Idle, Create, Stage, Pulse, Wait };
 struct DrawState { DrawStep step; int slot; WeaponDef* d; uint8_t* item; ULONGLONG t; };
 DrawState g_draw{ DrawStep::Idle, 0, nullptr, nullptr, 0 };
+ULONGLONG g_drawAsked = 0;   // choix dans la roue (chronométrage du changement d'arme)
 std::atomic<ULONGLONG> g_drawPulseFrom{0}, g_drawPulseUntil{0};
 bool UsingKbm();
 void TapKey(WPARAM vk, ULONGLONG holdMs);
@@ -1939,7 +2019,8 @@ void RunPendingCreate()
         if (SlotItem(p, kSlotHand) == g_draw.item) {
             g_handSlot = g_draw.slot;
             g_draw.step = DrawStep::Idle;
-            LOG("armes : %s sortie par le jeu", g_draw.d->label);
+            LOG("armes : %s sortie par le jeu (%llu ms apres le choix, %llu ms apres l'appui)", g_draw.d->label,
+                now - g_drawAsked, now - g_draw.t);
         } else if (now - g_draw.t > 1500) {
             // Le jeu ne l'a pas sortie : on la met en main directement.
             if (SlotItem(p, kSlot1H) == g_draw.item) StowTo(inv, kSlot1H, kSlotHand);
@@ -1968,6 +2049,7 @@ void SelectWeapon(int choice)
         if (h && g_handSlot == choice && DefOf(h) == d) return;   // déjà en main
         if (h && !HolsterHand()) return;
         g_draw = { DrawStep::Create, choice, d, nullptr, 0 };
+        g_drawAsked = GetTickCount64();
     }
     LOG("armes : choix %d -> ceinture=%s long1=%s long2=%s (en main : %d)", choice,
         g_belt ? g_belt->label : "-", g_long[0] ? g_long[0]->label : "-", g_long[1] ? g_long[1]->label : "-", g_handSlot);
@@ -2008,14 +2090,16 @@ std::atomic<bool> g_wheelOpen{false};
 extern std::atomic<bool> g_armOpen;
 bool ArmHoverActive();
 void UpdateWardrobeArmory();
-void BlockAutoEquip();
-bool PickupTargeted();
 std::atomic<ULONGLONG> g_pulseEnd{0};
 extern std::atomic<ULONGLONG> g_drawPulseFrom, g_drawPulseUntil;
-std::atomic<bool> g_holsterForPickup{false};
 extern std::atomic<bool> g_lastInputKbm;
-constexpr WORD kPadWheel = 0x0200;   // RB maintenu = roue (appui court = recharger / ramasser)
-float g_wheelHold = 0.5f;   // secondes de maintien de RB avant d'ouvrir la roue ([Wheel] HoldTime)
+constexpr WORD kPadWheel = 0x0200;      // RB : appui simulé pour que le jeu sorte l'arme rangée
+constexpr WORD kPadWheelKey = 0x0004;   // flèche gauche de la croix : roue (maintenue)
+constexpr WORD kPadFocusKey = 0x0008;   // flèche droite de la croix : focus (ralenti)
+int WheelKey();
+extern std::atomic<bool> g_pickupFree, g_pickupUp;
+extern std::atomic<int> g_pickupPress;
+extern std::atomic<ULONGLONG> g_pickupSince;
 std::atomic<bool> g_wheelUsed{false};   // l'appui RB en cours a ouvert la roue
 
 // RB est gardé par le mod pendant l'appui : le jeu ne le voit pas (il sortirait l'arme rangée,
@@ -2023,37 +2107,26 @@ std::atomic<bool> g_wheelUsed{false};   // l'appui RB en cours a ouvert la roue
 // on rejoue un appui de 120 ms au jeu : recharger / ramasser fonctionnent toujours.
 DWORD WINAPI GameXInputGetState(DWORD user, PadState* st)
 {
+    PerfScope perf(g_perf[kPerfPad]);
     const DWORD r = g_gameXInput ? g_gameXInput(user, st) : ERROR_DEVICE_NOT_CONNECTED;
     if (r == 0 && st && user < 4) {
         if (st->buttons || abs(st->lx) > 9000 || abs(st->ly) > 9000 || abs(st->rx) > 9000 || abs(st->ry) > 9000
             || st->lt > 60 || st->rt > 60) g_lastInputKbm = false;
         if (ArmHoverActive()) st->buttons &= ~0x1000;   // A sur « ARMES » : pour le mod
-        static ULONGLONG downSince[4] = {}, pulseFrom[4] = {}, pulseUntil[4] = {};
         const ULONGLONG now = GetTickCount64();
-        if (st->buttons & kPadWheel) {
-            if (!downSince[user]) { downSince[user] = now; g_wheelUsed = false; }
-            st->buttons &= ~kPadWheel;
-        } else if (downSince[user]) {
-            if (!g_wheelUsed.load() && now - downSince[user] < static_cast<ULONGLONG>(g_wheelHold * 1000.f)) {
-                // Appui court près d'une arme au sol avec une arme en main : le mod range d'abord
-                // l'arme en main (mise à jour du HUD), puis l'appui est rejoué : le jeu ramasse
-                // comme avec les mains vides (plus besoin de l'appui long « échanger »).
-                if (SlotItem(Player(), kSlotHand) && PickupTargeted()) {
-                    g_holsterForPickup = true;
-                    pulseFrom[user] = now + 200;
-                    pulseUntil[user] = now + 330;
-                } else {
-                    pulseFrom[user] = now;
-                    pulseUntil[user] = now + 120;
-                }
+        st->buttons &= ~kPadWheelKey;   // flèche gauche : la roue
+        st->buttons &= ~kPadFocusKey;   // flèche droite : le focus
+        {
+            // RB pour ramasser avec une place libre : gardé jusqu'au relâchement (le mod range l'arme
+            // tenue et rejoue l'appui, voir UpdatePickupFree).
+            static bool rbWas[4] = {}, rbKept[4] = {};
+            const bool rb = (st->buttons & kPadWheel) != 0;
+            if (rb && !rbWas[user] && g_pickupFree.load() && !g_pickupPress.load()) {
+                rbKept[user] = true; g_pickupSince = GetTickCount64(); g_pickupUp = false; g_pickupPress = 1;
             }
-            downSince[user] = 0;
-        }
-        if (now >= pulseFrom[user] && now < pulseUntil[user]) {
-            g_pulseEnd = pulseUntil[user];
-            st->buttons |= kPadWheel;
-            // Mains vides : le jeu sortirait l'arme rangée sur cet appui ; seul la roue choisit.
-            if (!SlotItem(Player(), kSlotHand)) BlockAutoEquip();
+            if (!rb && rbKept[user]) { rbKept[user] = false; g_pickupUp = true; }
+            rbWas[user] = rb;
+            if (rbKept[user]) st->buttons &= ~kPadWheel;
         }
         if (now >= g_drawPulseFrom.load() && now < g_drawPulseUntil.load()) st->buttons |= kPadWheel;   // sortie d'arme par le jeu
         if (g_wheelOpen.load()) { st->rx = 0; st->ry = 0; st->buttons &= ~(0x1000 | 0x2000 | 0x8000); }
@@ -2066,28 +2139,6 @@ DWORD WINAPI GameXInputGetState(DWORD user, PadState* st)
     return r;
 }
 
-// Le jeu sort tout seul l'arme rangée (« allow equip stowed weapon », bit 0x200 de +0xF0 du
-// composant personnage *(objet+0x68)+0x30) : le choix doit passer par la roue, on le coupe.
-// Cible 0x29 (eTARGET_TYPE_PICKUP_ITEM) du ciblage du joueur : une arme au sol est-elle ciblée ?
-bool PickupTargeted()
-{
-    if (!g_defsReady) return false;   // fiches chargées par le fil du jeu seulement
-    uint8_t* comps = CharComponents(Player());
-    if (!comps) return false;
-    auto* ts = *reinterpret_cast<uint8_t**>(comps + 0x140);
-    if (!ts) return false;
-    auto* map = *reinterpret_cast<uint8_t**>(ts + 0x60);
-    auto* entries = *reinterpret_cast<uint8_t**>(ts + 0x58);
-    if (!map || !entries) return false;
-    const uint8_t idx = map[8 + 0x29];
-    if (!idx) return false;
-    uint8_t* item = *reinterpret_cast<uint8_t**>(entries + idx * 0x38 + 0x28);
-    // Seulement les armes à feu reconnues : en planque, nourriture et objets sont souvent ciblés.
-    return item && DefOf(item) != nullptr;
-}
-
-// Le réglage « arme rangée autorisée » n'est coupé que le temps d'un appui court ; le jeu ne le
-// remet pas de lui-même (sans lui, il range aussitôt tout pistolet sorti) : on le rétablit après.
 // Armes « invisibles » du mod (pistolet-doigt) : composant d'affichage (type 0x20212FC) marqué
 // caché par FUN_140004100(composant, 1), la fonction qu'utilise le jeu pour les armes rangées.
 // Refait à chaque image : le jeu peut la réafficher en la sortant.
@@ -2133,9 +2184,39 @@ void WatchThrownWeapon()
     if (!h && lastHand && SlotItem(p, kSlot1H) != lastHand) g_itemDef.erase(lastHand);   // objet parti : oublié
     // Arme ramassée : le jeu ne passe pas toujours par Equip. Toute nouvelle arme en main sans
     // emplacement en reçoit un tout de suite (celui de l'arme échangée, le sien, ou un libre).
+    // Échange du jeu (arme en main remplacée directement) : l'ancienne est au sol, la nouvelle prend
+    // son emplacement (ou un de sa catégorie).
+    if (h && lastHand && h != lastHand && lastSlot >= 1 && g_handSlot == lastSlot && !DrawInProgress()
+        && SlotItem(p, kSlot1H) != lastHand) {
+        if (WeaponDef* nd = DefOf(h)) {
+            const int k = PickupSlotFor(nd, lastSlot);
+            if (k >= 1) { SlotRef(k) = nd; g_handSlot = k; }
+            g_pickupSlot = -1;
+            LOG("armes : echange, %s -> emplacement %d", nd->label, k);
+        }
+    }
+    // Arme ramassée pendant que le jeu range l'arme tenue (un pistolet passe à la ceinture quand on
+    // prend un fusil) : l'emplacement en cours est encore celui de l'ancienne. La nouvelle prend un
+    // emplacement libre, sinon celui de l'arme tenue (échange) ; l'ancienne quitte la ceinture du jeu
+    // (le sas du mod doit rester vide), elle reste dans la roue si elle y a encore sa place.
+    if (h && h != lastHand && g_handSlot >= 1 && !DrawInProgress()) {
+        WeaponDef* nd = DefOf(h);
+        if (nd && SlotRef(g_handSlot) != nd) {
+            int k = -1;
+            for (int s = 1; s <= 3; ++s) if (SlotRef(s) == nd) { k = s; break; }
+            if (k < 1) k = FreeSlotFor(nd);
+            if (k < 1) k = g_handSlot;
+            if (uint8_t* st = SlotItem(p, kSlot1H); st && st != h) ClearStaging();
+            SlotRef(k) = nd;
+            g_handSlot = k;
+            g_pickupSlot = -1;
+            if (nd->icon) LoadIconPack(nd->icon, nullptr);
+            LOG("armes : %s ramassee (arme tenue rangee par le jeu) -> emplacement %d", nd->label, k);
+        }
+    }
     if (h && h != lastHand && g_handSlot < 1 && !DrawInProgress()) {
         if (WeaponDef* nd = DefOf(h)) {
-            int k = g_pickupSlot;
+            int k = PickupSlotFor(nd, g_pickupSlot);
             g_pickupSlot = -1;
             if (k < 1) for (int s = 1; s <= 3; ++s) if (SlotRef(s) == nd) { k = s; break; }
             if (k < 1) k = FreeSlotFor(nd);
@@ -2155,6 +2236,70 @@ void WatchThrownWeapon()
 
 bool IconReady(const char* icon);
 
+// Ramasser une arme avec une place libre dans la roue : le jeu, lui, échangerait (l'arme tenue tombe
+// au sol). Pendant qu'une telle arme est visée (g_pickupFree), l'appui sur RB / R est gardé par le mod.
+// Maintenu (comme l'échange du jeu) : le mod range l'arme tenue dans son emplacement, puis rejoue un
+// appui ; le jeu prend l'arme les mains vides et elle va dans la place libre. Relâché tôt : l'appui
+// court est rejoué tel quel (recharger). Sans place libre, le jeu échange comme avant.
+std::atomic<bool> g_pickupFree{false};
+std::atomic<int> g_pickupPress{0};          // appui gardé en cours : 1 manette, 2 clavier
+std::atomic<ULONGLONG> g_pickupSince{0};    // début de l'appui gardé
+std::atomic<bool> g_pickupUp{false};        // appui gardé relâché
+extern std::atomic<ULONGLONG> g_drawPulseFrom, g_drawPulseUntil;
+void TapKey(WPARAM vk, ULONGLONG holdMs);
+
+void UpdatePickupFree()
+{
+    uint8_t* p = Player();
+    uint8_t* h = p ? SlotItem(p, kSlotHand) : nullptr;
+    static int replay = 0;
+    static ULONGLONG replayAt = 0;
+    const ULONGLONG now = GetTickCount64();
+    bool free = false;
+    if (h && g_handSlot >= 1 && !DrawInProgress()) {
+        uint8_t* t = TargetItem(p, 0x29);
+        WeaponDef* td = t && t != h ? DefOf(t) : nullptr;
+        free = td && !InSlots(td) && FreeSlotFor(td) >= 1;
+    }
+    g_pickupFree = free;
+    static bool fired = false;
+    if (const int press = g_pickupPress.load()) {
+        if (!fired && !g_pickupUp.load() && now - g_pickupSince.load() >= 400) {
+            fired = true;
+            WeaponDef* held = h ? DefOf(h) : nullptr;
+            if (h && HolsterHand()) LOG("armes : place libre, %s rangee avant de ramasser", held ? held->label : "?");
+            replay = press;
+            replayAt = now + 50;
+        }
+        if (g_pickupUp.load()) {
+            if (!fired) { replay = press; replayAt = now; }   // appui court : rejoué tel quel
+            fired = false;
+            g_pickupUp = false;
+            g_pickupPress = 0;
+        }
+    }
+    // L'appui est rejoué une fois les mains vides (ou au bout de 400 ms si le rangement a échoué).
+    if (replay && now >= replayAt && (!SlotItem(p, kSlotHand) || now >= replayAt + 350)) {
+        if (replay == 1) { g_drawPulseFrom = now; g_drawPulseUntil = now + 150; }
+        else TapKey('R', 120);
+        replay = 0;
+    }
+}
+
+// Arme du mod au sol visée (cible 0x29) : reconnue à son modèle 3D, sans rien créer.
+WeaponDef* TargetedModWeapon()
+{
+    if (!g_defsReady) return nullptr;
+    uint8_t* t = TargetItem(Player(), 0x29);
+    if (!t) return nullptr;
+    for (auto& d : g_defs) {
+        if (!d.model) continue;
+        const uint32_t uid = nw::LoadedModel(ModFile(d.model, ".skm").c_str());
+        if (uid && nw::HasModel(t, uid)) return &d;
+    }
+    return nullptr;
+}
+
 // Lance-roquettes : basé sur le lance-grenades multiple (MGL, une seule fonction de tir ; le
 // « rifle-grenade » est un fusil d'assaut à lance-grenades). Son objet reçoit sa propre fiche d'arme,
 // copie de celle du MGL : un seul mode de tir, une roquette par chargeur, plus rapide et presque sans
@@ -2168,6 +2313,7 @@ void KeepRocketInfo(uint8_t* item)
     static bool failed = false;
     static uint32_t glExpl = 0, ourExpl = 0;
     static float radiusMul = 1.6f;
+    static int clip = 1;
     static uint32_t prefer[4] = {};
     auto symName = [](uint32_t s) -> const char* { return reinterpret_cast<SymbolNameFn>(g_base + kSymbolNameRva)(s); };
     // Notre type d'explosion doit être dans le tableau du jeu avant chaque tir (le jeu le vide à son
@@ -2209,13 +2355,16 @@ void KeepRocketInfo(uint8_t* item)
         rp.explosion = ourExpl ? ourExpl : glExpl;
         LOG("armes : explosion de roquette %08X (grenade %08X)", rp.explosion, glExpl);
         rp.clip = GetPrivateProfileIntA("Rocket", "Clip", 1, g_iniPath);
+        clip = rp.clip;
         src = *pinfo;
         rocket = nw::MakeRocketWeaponInfo(src, rp, symName);
         if (!rocket) { failed = true; return; }
     }
     if (*pinfo != src) return;   // pas la fiche attendue (MGL) : on ne touche à rien
     *pinfo = rocket;
-    LOG("armes : lance-roquettes, fiche de roquette posee");
+    // L'objet a été créé avec le chargeur plein du MGL (6) : ramené à celui de la roquette.
+    const int had = nw::ClampClipAmmo(item, clip);
+    LOG("armes : lance-roquettes, fiche de roquette posee (chargeur %d -> %d)", had, clip);
 }
 // Nouvelles armes : leur modèle 3D (créé en mémoire au premier besoin) est posé sur l'objet de l'arme,
 // en main ou dans le sas, et les pièces d'origine sont gardées masquées.
@@ -2230,42 +2379,57 @@ void KeepCustomModels()
     // l'arme du mod est en main, la texture d'origine affiche notre silhouette, puis
     // retrouve son image. Une référence en plus sur la nôtre : le jeu peut libérer ce qu'il trouve.
     {
+        PerfScope perfIcon(g_perf[kPerfIcon]);
+        // Deux images remplacées au plus : l'arme du mod en main (HUD en haut à droite) et l'arme du
+        // mod visée au sol (invite « Prendre / Échanger contre »). Même icône d'origine : la visée gagne.
+        struct Swap { void** slot; void* saved; void* put; };
+        static Swap swaps[2] = {};
+        void** want[2] = {};
+        void* ours[2] = {};
         uint8_t* h = SlotItem(p, kSlotHand);
         auto it = h ? g_itemDef.find(h) : g_itemDef.end();
-        void** slot = nullptr;
-        void* ours = nullptr;
-        if (it != g_itemDef.end() && IsModIcon(it->second->icon) && IconReady(it->second->icon)) {
-            if (const char* orig = IconOfItem(h)) {
-                // Roue ouverte : on ne garde notre image que si aucune autre arme de la roue n'utilise
-                // cette icône d'origine (un vrai fusil d'assaut y montrerait sinon notre silhouette).
-                bool shared = false;
-                if (g_wheelOpen.load())
-                    for (int k = 1; k <= 3; ++k)
-                        if (WeaponDef* o = SlotRef(k); o && o != it->second && o->icon && strcmp(o->icon, orig) == 0) shared = true;
-                if (!shared) {
-                    slot = nw::TextureSrvSlot(orig);
-                    uint32_t tw = 0, th = 0;
-                    nw::TextureSize(orig, &tw, &th);   // pistolets : icônes carrées, fusils : 2:1
-                    ours = nw::IconSrvFor(it->second->icon, ModFile(it->second->icon, ".png").c_str(), tw, th);
-                }
+        WeaponDef* t = TargetedModWeapon();
+        WeaponDef* defs[2] = { it != g_itemDef.end() ? it->second : nullptr, t };
+        uint8_t* items[2] = { h, t ? TargetItem(p, 0x29) : nullptr };
+        for (int i = 0; i < 2; ++i) {
+            WeaponDef* d = defs[i];
+            if (!d || !items[i] || !IsModIcon(d->icon) || !IconReady(d->icon)) continue;
+            const char* orig = IconOfItem(items[i]);
+            if (!orig) continue;
+            // Roue ouverte : on ne garde notre image que si aucune autre arme de la roue n'utilise
+            // cette icône d'origine (un vrai fusil d'assaut y montrerait sinon notre silhouette).
+            bool shared = false;
+            if (g_wheelOpen.load())
+                for (int k = 1; k <= 3; ++k)
+                    if (WeaponDef* o = SlotRef(k); o && o != d && o->icon && strcmp(o->icon, orig) == 0) shared = true;
+            if (shared) continue;
+            want[i] = nw::TextureSrvSlot(orig);
+            uint32_t tw = 0, th = 0;
+            nw::TextureSize(orig, &tw, &th);   // pistolets : icônes carrées, fusils : 2:1
+            ours[i] = nw::IconSrvFor(d->icon, ModFile(d->icon, ".png").c_str(), tw, th);
+            if (!ours[i]) want[i] = nullptr;
+        }
+        if (want[0] && want[0] == want[1]) want[0] = nullptr;
+        // Rend d'abord les images qui ne sont plus voulues (ou plus les mêmes), puis pose les nouvelles.
+        for (int i = 0; i < 2; ++i) {
+            Swap& sw = swaps[i];
+            if (sw.slot && (sw.slot != want[i] || sw.put != ours[i])) {
+                MEMORY_BASIC_INFORMATION mbi{};
+                if (VirtualQuery(sw.slot, &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT && *sw.slot == sw.put) *sw.slot = sw.saved;
+                sw = {};
             }
         }
-        static void** swapped = nullptr;
-        static void* saved = nullptr;
-        static void* put = nullptr;
-        if (swapped && (swapped != slot || !ours)) {
-            MEMORY_BASIC_INFORMATION mbi{};
-            if (VirtualQuery(swapped, &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT && *swapped == put) *swapped = saved;
-            swapped = nullptr;
+        for (int i = 0; i < 2; ++i) {
+            Swap& sw = swaps[i];
+            if (!want[i] || sw.slot) continue;
+            sw.slot = want[i];
+            sw.saved = *want[i];
+            nw::AddRefSrv(ours[i]);
+            *want[i] = ours[i];
+            sw.put = ours[i];
         }
-        if (slot && ours && !swapped) {
-            saved = *slot;
-            nw::AddRefSrv(ours);
-            *slot = ours;
-            put = ours;
-            swapped = slot;
-        }
-    }    for (uint8_t* item : { SlotItem(p, kSlotHand), SlotItem(p, kSlot1H) }) {
+    }    PerfScope perfModels(g_perf[kPerfModels]);
+    for (uint8_t* item : { SlotItem(p, kSlotHand), SlotItem(p, kSlot1H) }) {
         if (!item) continue;
         auto it = g_itemDef.find(item);
         if (it == g_itemDef.end() || !it->second->model) continue;
@@ -2276,6 +2440,7 @@ void KeepCustomModels()
 
 void KeepHiddenWeapons()
 {
+    PerfScope perfHidden(g_perf[kPerfHidden]);
     uint8_t* h = SlotItem(Player(), kSlotHand);
     static uint8_t* lastHand = nullptr;
     static ULONGLONG since = 0;
@@ -2286,9 +2451,16 @@ void KeepHiddenWeapons()
     const bool modHidden = it != g_itemDef.end() && it->second->hidden;
     if (modHidden) { SetObjectHidden(h, true); return; }
     // Changement d'arme pendant un rechargement : le jeu cache l'arme le temps de l'animation et
-    // la nouvelle arme restait cachée. Dans les 4 s qui suivent sa sortie, une arme cachée est
-    // réaffichée (pas au-delà : le jeu cache parfois l'arme lui-même, cinématiques...).
-    if (now - since < 4000 && IsObjectHidden(h)) {
+    // la nouvelle arme restait cachée. Dans les 6 s qui suivent sa sortie, une arme cachée plus
+    // d'une seconde d'affilée est réaffichée. Pas avant : pendant l'animation de sortie, le jeu la
+    // cache un instant lui-même (la réafficher à ce moment déréglait la caméra). Pas au-delà non
+    // plus : le jeu cache parfois l'arme (cinématiques...).
+    static ULONGLONG hiddenSince = 0;
+    const bool hiddenNow = IsObjectHidden(h);
+    if (!hiddenNow || h != lastHand) hiddenSince = 0;
+    else if (!hiddenSince) hiddenSince = now;
+    if (now - since < 6000 && hiddenNow && hiddenSince && now - hiddenSince > 1000) {
+        hiddenSince = 0;
         int vis = 0, total = 0;
         nw::BindingVisibility(h, &vis, &total);
         LOG("armes : %s en main mais cachee (pieces visibles %d/%d) : reaffichee", LabelOf(h), vis, total);
@@ -2313,20 +2485,6 @@ void RestoreAutoEquip()
     *reinterpret_cast<uint64_t*>(ch + 0xF0) |= 0x200;
 }
 
-void BlockAutoEquip()
-{
-    uint8_t* comps = CharComponents(Player());
-    if (!comps) return;
-    auto* ch = *reinterpret_cast<uint8_t**>(comps + 0x30);
-    if (!ch) return;
-    auto* flags = reinterpret_cast<uint64_t*>(ch + 0xF0);
-    if (*flags & 0x200) {
-        *flags &= ~0x200ull;
-        static int logged = 0;
-        if (logged++ < 3) LOG("armes : sortie automatique de l'arme rangee coupee");
-    }
-}
-
 bool ReadPad(PadState& out)
 {
     static bool tried = false;
@@ -2340,8 +2498,27 @@ bool ReadPad(PadState& out)
         }
     }
     if (!g_xinput) return false;
-    for (DWORD i = 0; i < 4; ++i) if (g_xinput(i, &out) == 0) return true;
-    return false;
+    // XInputGetState est lent sur un port sans manette (plusieurs ms) et la lecture était demandée
+    // plusieurs fois par image : un seul état par image (~16 ms), et sans manette, une nouvelle
+    // recherche seulement chaque seconde. Appelé depuis plusieurs fils : sous verrou.
+    static SRWLOCK lock = SRWLOCK_INIT;
+    static PadState cached{};
+    static bool cachedOk = false;
+    static ULONGLONG at = 0;
+    static DWORD user = 0;
+    const ULONGLONG now = GetTickCount64();
+    AcquireSRWLockExclusive(&lock);
+    if (!at || now - at >= (cachedOk ? 10ull : 1000ull)) {
+        bool ok = cachedOk && g_xinput(user, &cached) == 0;
+        for (DWORD i = 0; i < 4 && !ok; ++i)
+            if (g_xinput(i, &cached) == 0) { user = i; ok = true; }
+        cachedOk = ok;
+        at = now;
+    }
+    out = cached;
+    const bool ok = cachedOk;
+    ReleaseSRWLockExclusive(&lock);
+    return ok;
 }
 
 // ---- Roue d'arme ---------------------------------------------------------------------------
@@ -2391,9 +2568,49 @@ bool IconReady(const char* icon)
     return GetTickCount64() - it->second > 1200;
 }
 
+// Invite du jeu pour ramasser / échanger une arme du mod au sol : le jeu y met le nom de l'arme
+// d'origine (« Fusil d'assaut ») ; le HUD le remplace par celui du mod (gtaPickupFrom / To).
+void PushPickupName(void* movie)
+{
+    static std::string last = "?";
+    std::string from, to, icon;
+    if (WeaponDef* d = TargetedModWeapon()) {
+        to = WeaponLabel(d);
+        if (d->icon) { LoadIconPack(d->icon, nullptr); if (IconReady(d->icon)) icon = d->icon; }
+        const char* hash = strchr(d->name, '#');
+        for (auto& b : g_defs)
+            if (hash && !strchr(b.name, '#') && strlen(b.name) == static_cast<size_t>(hash - d->name) && strncmp(b.name, d->name, hash - d->name) == 0)
+                from = WeaponLabel(&b);
+    }
+    static uint8_t* lastTarget = nullptr;
+    if (uint8_t* t = TargetItem(Player(), 0x29); t != lastTarget) {
+        lastTarget = t;
+        if (t) {
+            std::string models;
+            for (auto& d : g_defs) {
+                if (!d.model) continue;
+                const uint32_t uid = nw::LoadedModel(ModFile(d.model, ".skm").c_str());
+                char b[64];
+                snprintf(b, sizeof(b), " %s=%08X:%d", d.model, uid, uid ? nw::HasModel(t, uid) : -1);
+                models += b;
+            }
+            LOG("ramassage : vise %s (%p)%s -> %s", ObjName(t), t, models.c_str(), to.empty() ? "(arme du jeu)" : to.c_str());
+        } else {
+            LOG("ramassage : plus rien de vise");
+        }
+    }
+    if (from + "|" + to + "|" + icon == last) return;
+    LOG("ramassage : invite \"%s\" -> \"%s\" (icone %s)", from.c_str(), to.c_str(), icon.c_str());
+    last = from + "|" + to + "|" + icon;
+    SetFlashString(movie, "_root.gtaPickupIcon", icon.c_str());
+    SetFlashString(movie, "_root.gtaPickupFrom", from.c_str());
+    SetFlashString(movie, "_root.gtaPickupTo", to.c_str());
+}
+
 void PushWheel(void* movie, bool open)
 {
     if (!movie) return;
+    PushPickupName(movie);
     uint8_t* p = Player();
     SetFlashNumber(movie, "_root.gtaWheelOpen", open ? 1 : 0);
     // Les icônes sont envoyées même roue fermée : le HUD les charge à l'avance (sinon elles
@@ -2768,6 +2985,7 @@ constexpr uintptr_t kExtIfaceVtblRva = 0x1A19F80;
 using ExtCallbackFn = void(__fastcall*)(void* self, void* movie, const char* method, uint8_t* args, uint32_t argc);
 ExtCallbackFn g_origExtCallback = nullptr;
 std::atomic<bool> g_armHover{false};
+extern std::atomic<float> g_focusGain;
 std::atomic<ULONGLONG> g_armHoverTick{0};   // le Flash renvoie le signal toutes les ~0,5 s
 bool ArmHoverActive() { return g_armHover.load() && GetTickCount64() - g_armHoverTick.load() < 1500; }
 // Le 2e paramètre du rappel est déjà l'« enveloppe » de la scène (Movie* à +0x18), comme celle du HUD.
@@ -2788,6 +3006,13 @@ void __fastcall HookExtCallback(void* self, void* movie, const char* method, uin
                     g_langFr = fr;
                 }
             }
+            return;
+        }
+        if (strcmp(method, "GTA_FOCUS_GAIN") == 0 && args && argc >= 1) {
+            const uint32_t type = *reinterpret_cast<uint32_t*>(args + 0x18) & 0x8F;
+            const double v = type == 5 ? *reinterpret_cast<double*>(args + 0x20)
+                           : type == 3 || type == 4 ? *reinterpret_cast<int32_t*>(args + 0x20) : 0.0;
+            if (v > 0.0 && v <= 1.0) g_focusGain = g_focusGain.load() + static_cast<float>(v);
             return;
         }
         if (strcmp(method, "GTA_LOG") == 0 && args && argc >= 1) {
@@ -2856,17 +3081,18 @@ void UpdateWardrobeArmory()
 }
 
 // ---- Clavier / souris -----------------------------------------------------------------------
-// Mêmes gestes qu'à la manette, sur les touches du jeu : R (recharger / ramasser, l'équivalent de
-// RB) maintenu ouvre la roue, un appui court reste au jeu ; la souris choisit dans la roue (caméra
-// figée), relâcher R valide ; clic gauche = armurerie en planque ;
+// C maintenu ouvre la roue ([Wheel] Key ; R reste au jeu : recharger, ramasser, échanger) ; la souris
+// choisit dans la roue (caméra figée), relâcher valide ; clic gauche = armurerie en planque ;
 // 1 à 4 = mains nues, ceinture, armes longues (touches libres dans le jeu). Tab reste la carte.
 // Le jeu lit le clavier par WM_KEYDOWN et la caméra par Raw Input (WM_INPUT) : la fenêtre du jeu
 // est sous-classée pour retenir ces messages quand ils sont pour le mod.
 WNDPROC g_origWndProc = nullptr;
 HWND g_gameWnd = nullptr;
-std::atomic<ULONGLONG> g_rDownSince{0};       // R maintenu depuis (0 = relâché)
-std::atomic<bool> g_rReleased{false};         // R relâché (à traiter par la roue)
 std::atomic<int> g_letKeys{0};                // messages clavier rejoués pour le jeu
+extern int g_focusVk;
+extern std::atomic<bool> g_pickupFree, g_pickupUp;
+extern std::atomic<int> g_pickupPress;
+extern std::atomic<ULONGLONG> g_pickupSince;
 std::atomic<int> g_mouseX{0}, g_mouseY{0};    // déplacement de la souris pendant la roue
 std::atomic<bool> g_mouseLeft{false}, g_mouseRight{false};   // clics pendant la roue
 std::atomic<bool> g_lastInputKbm{false};      // dernier appareil utilisé : clavier/souris
@@ -2882,10 +3108,20 @@ LRESULT CALLBACK ModWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp)
     if (msg == WM_KEYDOWN || msg == WM_KEYUP || msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP || msg == WM_CHAR) {
         if (msg != WM_CHAR) g_lastInputKbm = true;
         const bool down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
-        // Rejoués par le mod (appui court sur R, sortie d'arme) : pour le jeu.
-        if (msg != WM_CHAR && g_letKeys.load() > 0 && (wp == 'R' || wp == VK_DOWN)) {
+        // Rejoués par le mod (sortie d'arme par la flèche du bas, R pour ramasser) : pour le jeu.
+        if (msg != WM_CHAR && g_letKeys.load() > 0 && (wp == VK_DOWN || wp == 'R')) {
             --g_letKeys;
             return CallWindowProcW(g_origWndProc, w, msg, wp, lp);
+        }
+        // Touche du focus : pour le mod seulement.
+        if (msg != WM_CHAR && static_cast<int>(wp) == g_focusVk) return 0;
+        // R pour ramasser avec une place libre : gardé jusqu'au relâchement (voir UpdatePickupFree).
+        if (msg != WM_CHAR && wp == 'R') {
+            static bool rKept = false;
+            if (down && !(lp & (1LL << 30)) && g_pickupFree.load() && !g_pickupPress.load()) {
+                rKept = true; g_pickupSince = GetTickCount64(); g_pickupUp = false; g_pickupPress = 2; return 0;
+            }
+            if (rKept) { if (!down) { rKept = false; g_pickupUp = true; } return 0; }
         }
         // Menu ARMES ouvert (ou sa ligne surlignée pour Entrée) : flèches, Entrée, Échap pour le mod
         // seulement, jusqu'au relâchement après la fermeture du menu.
@@ -2895,13 +3131,7 @@ LRESULT CALLBACK ModWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp)
             return 0;
         }
         if (msg == WM_CHAR && (wp == '\r' || wp == 27 || wp == 8) && (g_armOpen.load() || g_armKeysHeld.load())) return 0;
-        // R : décidé par le mod (roue, ou appui court rejoué au jeu).
-        if ((msg != WM_CHAR && wp == 'R') || (msg == WM_CHAR && (wp == 'r' || wp == 'R'))) {
-            if (msg == WM_KEYDOWN && !(lp & (1 << 30))) { g_rDownSince = GetTickCount64(); g_wheelUsed = false; }
-            if (msg == WM_KEYUP) { g_rDownSince = 0; g_rReleased = true; }
-            return 0;
-        }
-    } else if (msg == WM_INPUT) {
+        } else if (msg == WM_INPUT) {
         RAWINPUT ri{};
         UINT size = sizeof(ri);
         if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lp), RID_INPUT, &ri, &size, sizeof(RAWINPUTHEADER)) != static_cast<UINT>(-1)
@@ -2952,6 +3182,20 @@ void TapKey(WPARAM vk, ULONGLONG holdMs)
     g_keyTaps.push_back({ vk, GetTickCount64() + holdMs });
 }
 
+// Touche du clavier qui ouvre la roue : [Wheel] Key (une lettre ou un chiffre, C par défaut).
+int WheelKey()
+{
+    static int vk = 0;
+    if (!vk) {
+        char buf[16];
+        GetPrivateProfileStringA("Wheel", "Key", "C", buf, sizeof(buf), g_iniPath);
+        const char c = static_cast<char>(toupper(static_cast<unsigned char>(buf[0])));
+        vk = (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ? c : 'C';
+        LOG("armes : roue au clavier sur la touche %c", vk);
+    }
+    return vk;
+}
+
 // Clavier/souris : dernier appareil utilisé, ou pas de manette branchée.
 bool UsingKbm()
 {
@@ -2975,33 +3219,105 @@ WeaponKey g_weaponKeys[] = {
     { VK_F5, 1, false }, { VK_F6, 2, false }, { VK_F7, 0, false }, { VK_F8, 3, false },
 };
 
-void UpdateWheel(void* hud)
+// ---- Focus -----------------------------------------------------------------------------------
+// Barre bleue sous la jauge de combat (HUD) : elle se remplit comme la jauge jaune (le HUD envoie
+// GTA_FOCUS_GAIN à chaque gain de celle-ci, en fraction de la jauge). Flèche droite (manette) ou X
+// (clavier, [Focus] Key) : le temps ralentit ([Focus] SlowMo) et la barre se vide en [Focus] Duration
+// secondes (temps réel) ; un nouvel appui arrête le ralenti. Pendant la roue, son ralenti a la main.
+std::atomic<float> g_focusGain{0.f};   // gains reçus du HUD (fil de l'interface)
+float g_focus = 0.f;                   // 0 à 1
+bool g_focusOn = false;
+float g_focusBase = -1.f;              // vitesse du jeu avant le ralenti
+float g_focusSlow = 0.35f, g_focusDuration = 6.f, g_focusGainScale = 1.f;
+int g_focusVk = 'X';
+
+void FocusStop(const char* why)
 {
+    if (!g_focusOn) return;
+    g_focusOn = false;
+    LOG("focus : arret (%s), reste %.0f %%", why, g_focus * 100.f);
+}
+
+void UpdateFocus(void* movie)
+{
+    static bool init = false;
+    if (!init) {
+        init = true;
+        char buf[32];
+        GetPrivateProfileStringA("Focus", "SlowMo", "0.35", buf, sizeof(buf), g_iniPath);
+        g_focusSlow = static_cast<float>(atof(buf));
+        GetPrivateProfileStringA("Focus", "Duration", "15", buf, sizeof(buf), g_iniPath);
+        g_focusDuration = (std::max)(0.5f, static_cast<float>(atof(buf)));
+        GetPrivateProfileStringA("Focus", "Gain", "1.0", buf, sizeof(buf), g_iniPath);
+        g_focusGainScale = static_cast<float>(atof(buf));
+        GetPrivateProfileStringA("Focus", "Start", "1.0", buf, sizeof(buf), g_iniPath);   // barre au lancement
+        g_focus = (std::min)(1.f, (std::max)(0.f, static_cast<float>(atof(buf))));
+        GetPrivateProfileStringA("Focus", "Key", "X", buf, sizeof(buf), g_iniPath);
+        const char c = static_cast<char>(toupper(static_cast<unsigned char>(buf[0])));
+        g_focusVk = (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ? c : 'X';
+        LOG("focus : ralenti x%.2f, %.1f s, gain x%.2f, touche %c / fleche droite", g_focusSlow, g_focusDuration, g_focusGainScale, g_focusVk);
+    }
+    const ULONGLONG now = GetTickCount64();
+    static ULONGLONG last = now;
+    const float dt = (std::min)(0.25f, (now - last) / 1000.f);
+    last = now;
+
+    if (const float g = g_focusGain.exchange(0.f); g > 0.f) g_focus = (std::min)(1.f, g_focus + g * g_focusGainScale);
+
+    // Appui (front montant) : flèche droite de la croix ou touche du clavier, jeu au premier plan.
     PadState pad{};
     const bool padOk = ReadPad(pad);
-    // RB : la roue ne s'ouvre qu'après g_wheelHold secondes de maintien (un appui court reste au jeu).
-    static ULONGLONG rbSince = 0;
-    const bool rb = padOk && (pad.buttons & kPadWheel);
-    const ULONGLONG nowMs = GetTickCount64();
-    if (!rb) rbSince = 0;
-    else if (!rbSince) rbSince = nowMs;
-    const bool rbHeld = rb && (g_wheelOpen.load() || nowMs - rbSince >= static_cast<ULONGLONG>(g_wheelHold * 1000.f));
-    // Clavier : R maintenu (comme RB) ; un appui court est rejoué au jeu (recharger / ramasser).
-    const ULONGLONG rSince = g_rDownSince.load();
-    const bool rHeld = rSince && (g_wheelOpen.load() || nowMs - rSince >= static_cast<ULONGLONG>(g_wheelHold * 1000.f));
-    static ULONGLONG rTapAt = 0;
-    if (g_rReleased.exchange(false) && !g_wheelUsed.load() && !g_wheelOpen.load()) {
-        if (SlotItem(Player(), kSlotHand) && PickupTargeted()) {
-            // Ramassage avec une arme en main : la tenue est lâchée d'abord, puis R rejoué.
-            g_holsterForPickup = true;
-            rTapAt = nowMs + 200;
-        } else {
-            TapKey('R', 90);
+    const bool down = (padOk && (pad.buttons & kPadFocusKey))
+                   || (g_gameWnd && GetForegroundWindow() == g_gameWnd && (GetAsyncKeyState(g_focusVk) & 0x8000));
+    static bool was = false;
+    const bool press = down && !was;
+    was = down;
+    uint8_t* p = Player();
+    if (press && !g_armOpen.load()) {
+        if (g_focusOn) FocusStop("appui");
+        else if (p && g_focus >= 0.1f) { g_focusOn = true; LOG("focus : actif (%.0f %%)", g_focus * 100.f); }
+    }
+    if (g_focusOn) {
+        g_focus -= dt / g_focusDuration;
+        if (g_focus <= 0.f) { g_focus = 0.f; FocusStop("barre vide"); }
+        else if (!p) FocusStop("plus de joueur");
+    }
+
+    // Vitesse du jeu (la roue a son propre ralenti : on n'y touche pas pendant qu'elle est ouverte).
+    auto* ts = reinterpret_cast<float*>(g_base + kTimeScaleRva);
+    if (!g_wheelOpen.load()) {
+        if (g_focusOn) {
+            if (g_focusBase < 0.f) g_focusBase = *ts;
+            if (g_focusBase > 0.f) *ts = g_focusBase * g_focusSlow;
+        } else if (g_focusBase >= 0.f) {
+            *ts = g_focusBase;
+            g_focusBase = -1.f;
         }
     }
-    if (rTapAt && nowMs >= rTapAt) { rTapAt = 0; TapKey('R', 90); }
+
+    if (movie) {
+        static float shown = -1.f;
+        static bool shownOn = false;
+        if (fabsf(g_focus - shown) >= 0.005f || shownOn != g_focusOn) {
+            shown = g_focus;
+            shownOn = g_focusOn;
+            SetFlashNumber(movie, "_root.gtaFocus", g_focus);
+            SetFlashNumber(movie, "_root.gtaFocusOn", g_focusOn ? 1 : 0);
+        }
+    }
+}
+
+void UpdateWheel(void* hud)
+{
+    PerfScope perfWheel(g_perf[kPerfWheel]);
+    PadState pad{};
+    const bool padOk = ReadPad(pad);
+    // Roue : flèche gauche de la croix (manette) ou C (clavier, [Wheel] Key) maintenue, ouverture
+    // immédiate. R et RB restent entièrement au jeu (recharger, ramasser, échanger).
+    const bool dpad = padOk && (pad.buttons & kPadWheelKey);
+    const bool key = g_gameWnd && GetForegroundWindow() == g_gameWnd && (GetAsyncKeyState(WheelKey()) & 0x8000);
     UpdateKeyTaps();
-    const bool held = rbHeld || rHeld;
+    const bool held = dpad || key;
     static bool wasOpen = false;
     void* movie = HudMovie(hud);
     g_hudMovie = movie;
@@ -3094,9 +3410,66 @@ void UpdateWheel(void* hud)
     }
 }
 
+// Mod graphique ([Graphics] du .ini, relu chaque seconde : réglable en jouant).
+void UpdateGraphics()
+{
+    PerfScope perfGfx(g_perf[kPerfGfx]);
+    static gfx::Settings gs;
+    static ULONGLONG nextRead = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (now >= nextRead) {
+        nextRead = now + 1000;
+        static bool logSet = false;
+        if (!logSet) { logSet = true; gfx::SetLog([](const char* m) { LOG("%s", m); }); }
+        auto f = [](const char* key, const char* def) {
+            char buf[32];
+            GetPrivateProfileStringA("Graphics", key, def, buf, sizeof(buf), g_iniPath);
+            return static_cast<float>(atof(buf));
+        };
+        gs.enabled = GetPrivateProfileIntA("Graphics", "Enabled", 1, g_iniPath) != 0;
+        gs.bloomBoost = f("BloomBoost", "1.15");
+        gs.nightBloomBoost = f("NightBloomBoost", "1.6");
+        gs.bloomThreshold = f("BloomThreshold", "0.9");
+        gs.nightBloomThreshold = f("NightBloomThreshold", "0.7");
+        gs.bloomSaturation = f("BloomSaturation", "1.15");
+        gs.skySaturation = f("SkySaturation", "1.1");
+        gs.skyBoost = f("SkyBoost", "1.0");
+        gs.exposure = f("Exposure", "0.0");
+    }
+    gfx::Update(gs);
+}
+
+void ReportPerf()
+{
+    static LARGE_INTEGER freq{}, last{};
+    static uint64_t frames = 0;
+    if (!freq.QuadPart) { QueryPerformanceFrequency(&freq); QueryPerformanceCounter(&last); }
+    ++frames;
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    const double secs = double(now.QuadPart - last.QuadPart) / double(freq.QuadPart);
+    if (secs < 10.0) return;
+    char line[512];
+    int n = sprintf_s(line, "perf : %.0f images/s ; mod par image :", frames / secs);
+    double total = 0;
+    for (auto& sl : g_perf) {
+        const double ms = double(sl.ticks.exchange(0)) * 1000.0 / double(freq.QuadPart) / double(frames);
+        const double mx = double(sl.maxTicks.exchange(0)) * 1000.0 / double(freq.QuadPart);
+        const uint64_t calls = sl.calls.exchange(0);
+        total += ms;
+        n += sprintf_s(line + n, sizeof(line) - n, " %s %.3f ms (max %.2f, %.0f appels)", sl.name, ms, mx, double(calls) / double(frames));
+    }
+    LOG("%s ; total %.3f ms", line, total);
+    frames = 0;
+    last = now;
+}
+
 __declspec(noinline) void __fastcall HookHudUpdate(void* hud)
 {
     g_origHudUpdate(hud);
+    ReportPerf();
+    PerfScope perf(g_perf[kPerfHud]);
+    UpdateGraphics();
     static std::atomic<int> once{0};
     if (once.exchange(1) == 0) LOG("armes : mise a jour du HUD active (fil %lu)", GetCurrentThreadId());
     if (uint8_t* pl = Player()) {
@@ -3118,8 +3491,6 @@ __declspec(noinline) void __fastcall HookHudUpdate(void* hud)
         char buf[32];
         GetPrivateProfileStringA("Wheel", "SlowMo", "0.25", buf, sizeof(buf), g_iniPath);
         g_slowMo = static_cast<float>(atof(buf));
-        GetPrivateProfileStringA("Wheel", "HoldTime", "0.5", buf, sizeof(buf), g_iniPath);
-        g_wheelHold = static_cast<float>(atof(buf));
         // Par défaut l'inventaire du mod repart vide à chaque lancement (moins de cas tordus) ;
         // [Loadout] KeepBetweenSessions=1 garde les armes d'une session à l'autre.
         const bool keep = GetPrivateProfileIntA("Loadout", "KeepBetweenSessions", 0, g_iniPath) != 0;
@@ -3139,21 +3510,12 @@ __declspec(noinline) void __fastcall HookHudUpdate(void* hud)
     KeepHiddenWeapons();
     KeepCustomModels();
     WatchThrownWeapon();
+    UpdatePickupFree();
     RunDroppedCleanup();
-    if (g_holsterForPickup.exchange(false)) {
-        // Ramassage : l'arme tenue est lâchée (comme dans le jeu), la nouvelle prendra son emplacement.
-        uint8_t* h = SlotItem(Player(), kSlotHand);
-        void* inv = PlayerInventory();
-        if (h && inv) {
-            const int k = g_handSlot;
-            LOG("armes : ramassage, %s lachee", LabelOf(h));
-            HookUnEquip(inv, kSlotHand, 0);
-            g_pickupSlot = k;
-        }
-    }
     RunPendingCreate();
     RunPendingBelt();
     UpdateWheel(hud);
+    UpdateFocus(HudMovieCached());
     if (loadoutLoaded) UpdateFloorWeapons();
     static WeaponDef* savedLong[3] = { nullptr, nullptr, nullptr };
     if (loadoutLoaded && (savedLong[0] != g_long[0] || savedLong[1] != g_long[1] || savedLong[2] != g_belt)) {

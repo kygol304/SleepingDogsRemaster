@@ -14,10 +14,13 @@ var GTA_BAR_Y = 1042;
 var GTA_BAR_W = 301;
 var GTA_BAR_H = 7;
 var GTA_RESPECT_Y = 1052;
+var GTA_FOCUS_Y = 1062;
 var GTA_COLOR_BG = 0x000000;
 var GTA_COLOR_HEALTH = 0x6FC36F;
 var GTA_COLOR_LOW = 0xD9534F;
 var GTA_COLOR_RESPECT = 0xE2B340;
+var GTA_COLOR_FOCUS = 0x3A9BFF;
+var GTA_COLOR_FOCUS_ON = 0x8FD3FF;
 var GTA_FADE_DELAY = 6000;      // ms sans évènement avant d'estomper
 var GTA_FADE_ALPHA = 35;        // opacité quand le HUD est au repos
 
@@ -101,6 +104,36 @@ updateHealthMeter = function(health)
 };
 gtaSetHealth(gHealthValue === undefined ? gtaHealthMax : gHealthValue);
 
+// Barre de focus (bleue, sous la jauge de combat) : valeur et état envoyés par le plugin
+// (_root.gtaFocus 0..1, _root.gtaFocusOn) ; elle se remplit avec les gains de la jauge jaune.
+var gtaFocusBar = gtaHud.createEmptyMovieClip("focus", 3);
+gtaRect(gtaFocusBar.createEmptyMovieClip("bg", 1), 0, 0, GTA_BAR_W, GTA_BAR_H, GTA_COLOR_BG, 45);
+var gtaFocusFill = gtaFocusBar.createEmptyMovieClip("fill", 2);
+gtaRect(gtaFocusFill, 0, 0, GTA_BAR_W, GTA_BAR_H, 0xFFFFFF, 100);
+gtaFocusBar._x = GTA_BAR_X;
+gtaFocusBar._y = GTA_FOCUS_Y;
+gtaFocusBar._alpha = 0;
+var gtaFocusColor = new Color(gtaFocusFill);
+gtaFocusColor.setRGB(GTA_COLOR_FOCUS);
+gtaFocusFill._xscale = 0;
+var gtaFocusWasOn = false;
+
+function gtaUpdateFocus(barAlpha)
+{
+   var v = _root.gtaFocus;
+   if (v == undefined) v = 0;
+   gtaFocusFill._xscale = Math.max(0, Math.min(1, v)) * 100;
+   var on = _root.gtaFocusOn == 1;
+   if (on != gtaFocusWasOn) {
+      gtaFocusWasOn = on;
+      gtaFocusColor.setRGB(on ? GTA_COLOR_FOCUS_ON : GTA_COLOR_FOCUS);
+      if (on) gtaCombat();
+   }
+   var a = on ? 100 : barAlpha;
+   gtaFocusBar._alpha = a;
+   gtaFocusBar._visible = a > 0;
+}
+
 function gtaSetRespect(value)
 {
    if (mc_CombatMeter._totalframes > gtaRespectMax) gtaRespectMax = mc_CombatMeter._totalframes;
@@ -117,6 +150,9 @@ CombatMeter_Update = function(oldCombatValue, combatValue, meterActivated)
    gtaOriginalCombat(oldCombatValue, combatValue, meterActivated);
    gtaSetRespect(combatValue);
    if (combatValue != oldCombatValue) gtaCombat();                  // coup donné
+   // Gain de la jauge jaune : la barre de focus gagne la même part.
+   if (combatValue > oldCombatValue && gtaRespectMax > 0)
+      flash.external.ExternalInterface.call("GTA_FOCUS_GAIN", (combatValue - oldCombatValue) / gtaRespectMax);
 };
 gtaSetRespect(0);
 
@@ -196,7 +232,72 @@ gtaHud.onEnterFrame = function()
    gtaRespect._alpha = b;
    gtaBar._visible = b > 0;
    gtaRespect._visible = b > 0;
+   gtaUpdateFocus(b);
+
+   gtaPickupRefresh();
 };
+
+// Invite « Maintenir RB : échanger contre … » sur une arme du mod au sol (GameplayHelp_Show, avec
+// l'icône de l'arme) : le jeu y met le nom et l'icône de l'arme d'origine (_root.gtaPickupFrom, ex.
+// « Fusil d'assaut ») ; on met celui du mod (gtaPickupTo ; l'image de l'icône est remplacée par le plugin). Nom d'origine introuvable
+// (autre langue) : on remplace ce qui suit « contre » / « for ».
+function gtaPickupReplace(txt)
+{
+   var to = _root.gtaPickupTo;
+   if (txt == undefined || to == undefined || to == "") return txt;
+   var orig = txt;
+   txt = String(txt);
+   if (txt.charAt(0) == "$") txt = com.utils.Localizer.LocalizeString(txt);
+   var upTxt = txt.toUpperCase();
+   var name = (upTxt == txt) ? to.toUpperCase() : to;
+   if (upTxt.indexOf(to.toUpperCase()) >= 0) return orig;
+   var from = String(_root.gtaPickupFrom).toUpperCase();
+   var i = from.length > 0 ? upTxt.indexOf(from) : -1;
+   if (i >= 0) return txt.substr(0, i) + name + txt.substr(i + from.length);
+   // « Échanger contre X », « Prendre X » (le jeu n'a pas le même nom que la table du mod).
+   var seps = [" CONTRE ", "PRENDRE ", "RAMASSER ", " FOR ", "PICK UP ", "TAKE "];
+   for (var k = 0; k < seps.length; k++) {
+      var j = upTxt.lastIndexOf(seps[k]);
+      if (j >= 0) return txt.substr(0, j + seps[k].length) + name;
+   }
+   return orig;
+}
+
+var gtaOriginalHelpShow = GameplayHelp_Show;
+var gtaLastHelpLog = "";
+GameplayHelp_Show = function(button0, helpTxt0, icon0, isHold0, button1, helpTxt1, icon1, isHold1)
+{
+   var t0 = gtaPickupReplace(helpTxt0);
+   var t1 = gtaPickupReplace(helpTxt1);
+   // L'icône garde son nom : le plugin remplace son image (à la bonne taille).
+   var i0 = icon0;
+   var i1 = icon1;
+   var log = helpTxt0 + " [" + icon0 + "] -> " + t0 + " [" + i0 + "] | " + helpTxt1 + " [" + icon1 + "] -> " + t1;
+   if (log != gtaLastHelpLog) {
+      gtaLastHelpLog = log;
+      flash.external.ExternalInterface.call("GTA_LOG", "invite : " + log);
+   }
+   gtaHelpArgs = [button0, helpTxt0, icon0, isHold0, button1, helpTxt1, icon1, isHold1];
+   gtaHelpShown = t0 + "|" + t1;
+   gtaOriginalHelpShow(button0, t0, i0, isHold0, button1, t1, i1, isHold1);
+};
+var gtaHelpArgs = undefined;
+var gtaHelpShown = "";
+var gtaOriginalHelpHide = GameplayHelp_Hide;
+GameplayHelp_Hide = function()
+{
+   gtaHelpArgs = undefined;
+   gtaOriginalHelpHide();
+};
+
+// Le nom du mod peut arriver une image après l'invite : elle est refaite si son texte change.
+function gtaPickupRefresh()
+{
+   if (gtaHelpArgs == undefined || !mc_GameplayHelp._visible || _root.gtaPickupTo == undefined || _root.gtaPickupTo == "") return;
+   var a = gtaHelpArgs;
+   if (gtaPickupReplace(a[1]) + "|" + gtaPickupReplace(a[5]) == gtaHelpShown) return;
+   GameplayHelp_Show(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]);
+}
 
 
 // ===== Langue du jeu ======================================================================

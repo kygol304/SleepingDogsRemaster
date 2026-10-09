@@ -13,10 +13,19 @@ void Update();
 
 // Crée (une fois) le modèle décrit par un fichier .skm. Renvoie son uid, 0 en cas d'échec.
 uint32_t LoadModel(const char* path);
+// uid du modèle si ce fichier a déjà été chargé, 0 sinon (ne crée rien : sûr depuis tout fil).
+uint32_t LoadedModel(const char* path);
 
 // Masque les pièces d'origine de l'objet et y attache le modèle uid (sans effet si déjà fait,
 // sauf pour re-masquer les pièces que le jeu aurait réaffichées). Vrai si le modèle a été ajouté.
 bool ApplyModel(void* simObject, uint32_t uid);
+
+// Vrai si l'objet porte le modèle uid (une arme du mod, même lâchée puis ramassée).
+bool HasModel(void* simObject, uint32_t uid);
+
+// Chargeur de l'arme ramené à maxAmmo au plus (composant GunComponent). Rend les munitions qu'il
+// contenait avant, -1 si l'objet n'a pas de composant d'arme à feu.
+int ClampClipAmmo(void* simObject, int maxAmmo);
 
 // Nombre de pièces (liaisons rigides) visibles / au total sur l'objet (diagnostic).
 void BindingVisibility(void* simObject, int* visible, int* total);

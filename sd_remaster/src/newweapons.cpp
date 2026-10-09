@@ -63,13 +63,31 @@ void InitHandle(void* handle, u32 type, u32 uid)
     Fn<void(__fastcall*)(void*, u32, u32, void*)>(kHandleInit)(handle, type, uid, InventoryOf(type));
 }
 
+// Vérifie qu'une zone mémoire du jeu est lisible. VirtualQuery est lent dans ce jeu (énormément de
+// zones mémoire) et la vérification servait plusieurs fois par image : ~3 ms par image avec l'AK en
+// main. Les zones déjà vérifiées sont gardées en cache et revérifiées toutes les 500 ms.
 bool Readable(const void* p, size_t n)
 {
     if (!p) return false;
+    struct Region { uintptr_t lo, hi; ULONGLONG at; };
+    static Region cache[32] = {};
+    static unsigned next = 0;
+    static SRWLOCK lock = SRWLOCK_INIT;
+    const uintptr_t a = reinterpret_cast<uintptr_t>(p), b = a + n;
+    const ULONGLONG now = GetTickCount64();
+    AcquireSRWLockShared(&lock);
+    for (const Region& r : cache)
+        if (a >= r.lo && b <= r.hi && now - r.at < 500) { ReleaseSRWLockShared(&lock); return true; }
+    ReleaseSRWLockShared(&lock);
     MEMORY_BASIC_INFORMATION mbi;
     if (!VirtualQuery(p, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT) return false;
     if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return false;
-    return static_cast<const uint8_t*>(p) + n <= static_cast<const uint8_t*>(mbi.BaseAddress) + mbi.RegionSize;
+    const uintptr_t lo = reinterpret_cast<uintptr_t>(mbi.BaseAddress), hi = lo + mbi.RegionSize;
+    if (b > hi) return false;
+    AcquireSRWLockExclusive(&lock);
+    cache[next++ % 32] = { lo, hi, now };
+    ReleaseSRWLockExclusive(&lock);
+    return true;
 }
 
 CompositeDrawableComponent* DrawableOf(void* simObject)
@@ -348,6 +366,12 @@ uint32_t LoadModel(const char* path)
     mesh->mIndexStart = 0;
     mesh->mNumPrims = ni / 3;
 
+    // Tampons statiques : NewBuffer les marque « créés à l'exécution » (+0x59), et le moteur leur donne
+    // alors un tampon GPU dynamique (FUN_140A1E070) ; sans cette marque, ils suivent le chemin des
+    // modèles du jeu (copie unique vers un tampon GPU statique). Avec la marque, tenir l'AK coûtait
+    // ~8 ms par image.
+    vb->mRunTimeCreated = 0;
+    ib->mRunTimeCreated = 0;
     AddResource(material);
     AddResource(vb);
     AddResource(ib);
@@ -663,6 +687,40 @@ bool TextureSize(const char* name, uint32_t* w, uint32_t* h)
     *w = res->mDesc.Width;
     *h = res->mDesc.Height;
     return *w && *h;
+}
+
+
+uint32_t LoadedModel(const char* path)
+{
+    auto it = g_models.find(path);
+    return it != g_models.end() ? it->second : 0;
+}
+
+int ClampClipAmmo(void* simObject, int maxAmmo)
+{
+    if (!Readable(simObject, sizeof(SimObject))) return -1;
+    auto& arr = static_cast<SimObject*>(simObject)->m_Components;
+    if (arr.size > 64 || !Readable(arr.p, arr.size * sizeof(SimComponentHolder))) return -1;
+    for (u32 i = 0; i < arr.size; ++i) {
+        if (arr.p[i].m_TypeUID != GunComponent::_TypeUID) continue;
+        auto* gc = reinterpret_cast<GunComponent*>(arr.p[i].m_pComponent);
+        if (!Readable(gc, sizeof(GunComponent))) return -1;
+        const int before = gc->mClipAmmo[0];
+        for (int& a : gc->mClipAmmo) if (a > maxAmmo) a = maxAmmo;
+        return before;
+    }
+    return -1;
+}
+
+bool HasModel(void* simObject, uint32_t uid)
+{
+    auto* cdc = DrawableOf(simObject);
+    if (!cdc || !uid) return false;
+    bool has = false;
+    ForModelTypes(cdc, [&](u32, ModelType* mt) {
+        ForRigid(mt, [&](uint8_t* b) { if (*reinterpret_cast<u32*>(b + kBind_ModelUid) == uid) has = true; });
+    });
+    return has;
 }
 
 }  // namespace nw
