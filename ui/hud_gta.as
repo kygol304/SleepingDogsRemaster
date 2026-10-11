@@ -49,6 +49,22 @@ function gtaRect(mc, x, y, w, h, color, alpha)
    mc.endFill();
 }
 
+// Texte centré (police du HUD). Défini avant tout usage : les fonctions ne sont pas remontées en
+// tête du script (le compteur, créé plus haut, n'avait pas de texte).
+function gtaText(mc, name, x, y, w, size)
+{
+   mc.createTextField(name, mc.getNextHighestDepth(), x - w / 2, y - size, w, size * 2);
+   var tf = mc[name];
+   tf.embedFonts = true;
+   tf.selectable = false;
+   var f = mc_Money.tf_money.getTextFormat();
+   f.size = size;
+   f.align = "center";
+   f.color = 0xFFFFFF;
+   tf.setNewTextFormat(f);
+   return tf;
+}
+
 function gtaWake()
 {
    gtaLastEvent = getTimer();
@@ -117,6 +133,44 @@ var gtaFocusColor = new Color(gtaFocusFill);
 gtaFocusColor.setRGB(GTA_COLOR_FOCUS);
 gtaFocusFill._xscale = 0;
 var gtaFocusWasOn = false;
+
+// Compteur de vitesse (en bas à droite, en voiture : _root.gtaSpeed en km/h, -1 à pied) et, dessous,
+// la barre de nitro des voitures équipées (_root.gtaNitro 0..1, _root.gtaNitroState 0 / 1 prête / 2 injection).
+var GTA_SPEEDO_X = 500;    // à droite de la mini-carte (en bas à droite : cadre des défis du jeu)
+var GTA_SPEEDO_Y = 950;
+var gtaSpeedo = _root.createEmptyMovieClip("gtaSpeedo", 16023);   // hors de gtaHud : ses textes ne s'y affichaient pas
+gtaSpeedo._x = GTA_SPEEDO_X;
+gtaSpeedo._y = GTA_SPEEDO_Y;
+gtaSpeedo.num = gtaText(gtaSpeedo, "num", 0, 20, 260, 46);
+gtaSpeedo.unit = gtaText(gtaSpeedo, "unit", 0, 62, 260, 14);
+gtaSpeedo.unit.text = "KM/H";
+gtaSpeedo._visible = false;
+var GTA_NITRO_W = 180;
+var gtaNitroBar = gtaSpeedo.createEmptyMovieClip("nitro", 10);
+gtaRect(gtaNitroBar.createEmptyMovieClip("bg", 1), 0, 0, GTA_NITRO_W, 8, GTA_COLOR_BG, 55);
+var gtaNitroFill = gtaNitroBar.createEmptyMovieClip("fill", 2);
+gtaRect(gtaNitroFill, 0, 0, GTA_NITRO_W, 8, 0xFFFFFF, 100);
+gtaNitroBar._x = -GTA_NITRO_W / 2;
+gtaNitroBar._y = 84;
+gtaNitroBar._visible = false;
+var gtaNitroColor = new Color(gtaNitroFill);
+gtaNitroBar.label = gtaText(gtaSpeedo, "nitroLabel", 0, 106, 200, 12);
+
+function gtaUpdateNitro()
+{
+   var speed = _root.gtaSpeed;
+   gtaSpeedo._visible = speed != undefined && speed >= 0;
+   if (!gtaSpeedo._visible) return;
+   gtaSpeedo.num.text = String(speed);
+   var st = _root.gtaNitroState;
+   gtaNitroBar._visible = st == 1 || st == 2;
+   gtaNitroBar.label.text = gtaNitroBar._visible ? "NITRO" : "";
+   if (!gtaNitroBar._visible) return;
+   var v = _root.gtaNitro;
+   if (v == undefined) v = 0;
+   gtaNitroFill._xscale = Math.max(0, Math.min(1, v)) * 100;
+   gtaNitroColor.setRGB(st == 2 ? 0xFFD27F : 0xFF8A1E);
+}
 
 function gtaUpdateFocus(barAlpha)
 {
@@ -233,6 +287,7 @@ gtaHud.onEnterFrame = function()
    gtaBar._visible = b > 0;
    gtaRespect._visible = b > 0;
    gtaUpdateFocus(b);
+   gtaUpdateNitro();
 
    gtaPickupRefresh();
 };
@@ -264,7 +319,6 @@ function gtaPickupReplace(txt)
 }
 
 var gtaOriginalHelpShow = GameplayHelp_Show;
-var gtaLastHelpLog = "";
 GameplayHelp_Show = function(button0, helpTxt0, icon0, isHold0, button1, helpTxt1, icon1, isHold1)
 {
    var t0 = gtaPickupReplace(helpTxt0);
@@ -272,11 +326,6 @@ GameplayHelp_Show = function(button0, helpTxt0, icon0, isHold0, button1, helpTxt
    // L'icône garde son nom : le plugin remplace son image (à la bonne taille).
    var i0 = icon0;
    var i1 = icon1;
-   var log = helpTxt0 + " [" + icon0 + "] -> " + t0 + " [" + i0 + "] | " + helpTxt1 + " [" + icon1 + "] -> " + t1;
-   if (log != gtaLastHelpLog) {
-      gtaLastHelpLog = log;
-      flash.external.ExternalInterface.call("GTA_LOG", "invite : " + log);
-   }
    gtaHelpArgs = [button0, helpTxt0, icon0, isHold0, button1, helpTxt1, icon1, isHold1];
    gtaHelpShown = t0 + "|" + t1;
    gtaOriginalHelpShow(button0, t0, i0, isHold0, button1, t1, i1, isHold1);
@@ -346,19 +395,6 @@ function gtaCircle(mc, r, color, alpha)
    mc.endFill();
 }
 
-function gtaText(mc, name, x, y, w, size)
-{
-   mc.createTextField(name, mc.getNextHighestDepth(), x - w / 2, y - size, w, size * 2);
-   var tf = mc[name];
-   tf.embedFonts = true;
-   tf.selectable = false;
-   var f = mc_Money.tf_money.getTextFormat();
-   f.size = size;
-   f.align = "center";
-   f.color = 0xFFFFFF;
-   tf.setNewTextFormat(f);
-   return tf;
-}
 
 var gtaWheel = _root.createEmptyMovieClip("gtaWheel", 16010);
 gtaWheel._x = GTA_WHEEL_X;
@@ -467,24 +503,145 @@ gtaWheelCtl.onEnterFrame = function()
 // Écrit par le plugin : _root.gtaArmOpen, gtaArmTitle, gtaArmR0..R8 (lignes visibles), gtaArmSel.
 _root.gtaArmOpen = 0;
 var GTA_ARM_ROWS = 9;
+// Style des boutiques du jeu (boutique de vêtements) : panneau sombre à fin liseré gris, grand titre
+// au-dessus, lignes en capitales alignées à gauche, ligne choisie dans un cadre doré lumineux, bandeau
+// en bas du panneau, rappel des touches en bas à gauche de l'écran.
+var GTA_SHOP_W = 690;
+var GTA_SHOP_H = 800;
+var GTA_SHOP_GOLD = 0xF2B33D;
+
+function gtaRoundRect(mc, x, y, w, h, r)
+{
+   mc.moveTo(x + r, y);
+   mc.lineTo(x + w - r, y);
+   mc.curveTo(x + w, y, x + w, y + r);
+   mc.lineTo(x + w, y + h - r);
+   mc.curveTo(x + w, y + h, x + w - r, y + h);
+   mc.lineTo(x + r, y + h);
+   mc.curveTo(x, y + h, x, y + h - r);
+   mc.lineTo(x, y + r);
+   mc.curveTo(x, y, x + r, y);
+}
+
+// Texte aligné à gauche (police du HUD).
+function gtaTextL(mc, name, x, y, w, size)
+{
+   var tf = gtaText(mc, name, x + w / 2, y, w, size);
+   var f = tf.getNewTextFormat();
+   f.align = "left";
+   tf.setNewTextFormat(f);
+   return tf;
+}
+
 var gtaArm = _root.createEmptyMovieClip("gtaArm", 16020);
-gtaArm._x = 760;
-gtaArm._y = 250;
-gtaRect(gtaArm.createEmptyMovieClip("bg", 1), 0, 0, 400, 560, 0x000000, 75);
-gtaRect(gtaArm.createEmptyMovieClip("head", 2), 0, 0, 400, 64, 0xFFFFFF, 12);
-gtaArm.title = gtaText(gtaArm, "title", 200, 36, 380, 26);
-gtaArm.hint = gtaText(gtaArm, "hint", 200, 540, 380, 15);
+gtaArm._x = 1140;
+gtaArm._y = 170;
+var gtaShopBg = gtaArm.createEmptyMovieClip("bg", 1);
+gtaShopBg.beginFill(0x0A0A0A, 84);
+gtaShopBg.lineStyle(2, 0x5E5E5E, 100);
+gtaShopBg.moveTo(0, 0);
+gtaShopBg.lineTo(GTA_SHOP_W, 0);
+gtaShopBg.lineTo(GTA_SHOP_W, GTA_SHOP_H);
+gtaShopBg.lineTo(0, GTA_SHOP_H);
+gtaShopBg.lineTo(0, 0);
+gtaShopBg.endFill();
+// Titre au-dessus du panneau, à droite, et sous-titre.
+gtaArm.title = gtaText(gtaArm, "title", GTA_SHOP_W - 300, -62, 560, 38);
+var gtaTitleFmt = gtaArm.title.getNewTextFormat();
+gtaTitleFmt.align = "right";
+gtaTitleFmt.color = 0xF6EBD2;
+gtaArm.title.setNewTextFormat(gtaTitleFmt);
+gtaArm.sub = gtaText(gtaArm, "sub", GTA_SHOP_W - 300, -18, 560, 16);
+var gtaSubFmt = gtaArm.sub.getNewTextFormat();
+gtaSubFmt.align = "right";
+gtaArm.sub.setNewTextFormat(gtaSubFmt);
+// Bandeau du bas : texte doré (aide), bordure grise, comme le bandeau de réputation.
+var gtaShopFoot = gtaArm.createEmptyMovieClip("foot", 3);
+gtaShopFoot.lineStyle(2, 0x4A4A4A, 100);
+gtaShopFoot.beginFill(0x000000, 60);
+gtaShopFoot.moveTo(22, GTA_SHOP_H - 76);
+gtaShopFoot.lineTo(GTA_SHOP_W - 22, GTA_SHOP_H - 76);
+gtaShopFoot.lineTo(GTA_SHOP_W - 22, GTA_SHOP_H - 22);
+gtaShopFoot.lineTo(22, GTA_SHOP_H - 22);
+gtaShopFoot.lineTo(22, GTA_SHOP_H - 76);
+gtaShopFoot.endFill();
+gtaArm.hint = gtaTextL(gtaArm, "hint", 46, GTA_SHOP_H - 49, GTA_SHOP_W - 92, 16);
+var gtaHintFmt = gtaArm.hint.getNewTextFormat();
+gtaHintFmt.color = GTA_SHOP_GOLD;
+gtaArm.hint.setNewTextFormat(gtaHintFmt);
 gtaArm.hint.text = "";
+// Cadre de la ligne choisie : contour doré arrondi, fond doré très léger, halo.
+var gtaShopSel = gtaArm.createEmptyMovieClip("sel", 5);
+gtaShopSel.lineStyle(2, GTA_SHOP_GOLD, 100);
+gtaShopSel.beginFill(GTA_SHOP_GOLD, 10);
+gtaRoundRect(gtaShopSel, 0, 0, 310, 44, 6);
+gtaShopSel.endFill();
+gtaShopSel._x = 40;
+gtaShopSel.filters = [new flash.filters.GlowFilter(GTA_SHOP_GOLD, 0.75, 14, 14, 1.6, 2)];
 var gtaArmRows = [];
 for (var ri = 0; ri < GTA_ARM_ROWS; ri++) {
    var row = gtaArm.createEmptyMovieClip("row" + ri, 10 + ri);
-   row._y = 80 + ri * 48;
-   row.bg = row.createEmptyMovieClip("bg", 1);
-   gtaRect(row.bg, 12, 0, 376, 42, 0xFFFFFF, 100);
-   row.label = gtaText(row, "label", 200, 21, 360, 20);
+   row._y = 70 + ri * 48;
+   row.label = gtaTextL(row, "label", 60, 22, GTA_SHOP_W - 120, 20);
    gtaArmRows.push(row);
 }
+// Rappel des touches, en bas à gauche de l'écran comme dans les boutiques.
+var gtaShopKeys = _root.createEmptyMovieClip("gtaShopKeys", 16025);
+gtaShopKeys.tf = gtaTextL(gtaShopKeys, "tf", 80, 950, 1000, 20);
+gtaShopKeys._visible = false;
 gtaArm._alpha = 0;
+
+// Atelier : fondu au noir plein écran (_root.gtaFade 0..100), sous le menu.
+var gtaFadeMc = _root.createEmptyMovieClip("gtaFadeMc", 16019);
+gtaRect(gtaFadeMc, -200, -200, 2400, 1500, 0x000000, 100);
+gtaFadeMc._alpha = 0;
+gtaFadeMc._visible = false;
+
+// Atelier : statistiques sous le menu (_root.gtaStatShow, gtaStatL0..3 libellés, gtaStatA0..3 avant,
+// gtaStatB0..3 après, 0..1). Barre blanche = installé, verte = gain essayé, rouge = perte.
+var GTA_STAT_ROWS = 4;
+var gtaStats = _root.createEmptyMovieClip("gtaStats", 16024);
+gtaStats._y = 170 + GTA_SHOP_H - 76 - 176;
+var gtaStatRows = [];
+for (var si = 0; si < GTA_STAT_ROWS; si++) {
+   var sr = gtaStats.createEmptyMovieClip("stat" + si, 10 + si);
+   sr._y = 14 + si * 40;
+   sr.label = gtaTextL(sr, "label", 46, 14, 230, 15);
+   sr.track = sr.createEmptyMovieClip("track", 2);
+   gtaRect(sr.track, 290, 10, 350, 8, 0xFFFFFF, 18);
+   sr.gain = sr.createEmptyMovieClip("gain", 3);
+   gtaRect(sr.gain, 0, 0, 100, 8, 0xFFFFFF, 100);
+   sr.gain._x = 290; sr.gain._y = 10;
+   sr.base = sr.createEmptyMovieClip("base", 4);
+   gtaRect(sr.base, 0, 0, 100, 8, 0xFFFFFF, 100);
+   sr.base._x = 290; sr.base._y = 10;
+   gtaStatRows.push(sr);
+}
+gtaStats._visible = false;
+
+function gtaUpdateStats()
+{
+   var show = _root.gtaStatShow == 1 && _root.gtaArmOpen == 1;
+   gtaStats._visible = show;
+   if (!show) return;
+   gtaStats._x = gtaArm._x;
+   for (var i = 0; i < GTA_STAT_ROWS; i++) {
+      var r = gtaStatRows[i];
+      var a = _root["gtaStatA" + i];
+      var b = _root["gtaStatB" + i];
+      if (a == undefined) a = 0;
+      if (b == undefined) b = a;
+      a = Math.max(0, Math.min(1, a));
+      b = Math.max(0, Math.min(1, b));
+      r.label.text = _root["gtaStatL" + i] == undefined ? "" : _root["gtaStatL" + i];
+      r.base._xscale = Math.min(a, b) * 350;
+      r.gain._xscale = Math.max(a, b) * 350;
+      new Color(r.gain).setRGB(b >= a ? 0x4CD964 : 0xE04040);
+   }
+}
+
+// Garage de tuning : rappel en bas de l'écran quand la voiture est dans un garage (_root.gtaGarageHint).
+var gtaGarageHintTf = gtaText(_root.createEmptyMovieClip("gtaGarageHintMc", 16022), "txt", 960, 900, 900, 20);
 
 // Rappel sous la roue quand on est dans une planque.
 gtaWheel.armHint = gtaText(gtaWheel, "armHint", 0, 345, 420, 16);
@@ -495,11 +652,21 @@ gtaArmCtl.onEnterFrame = function()
 {
    if (!gtaLangKnown && (gtaLangTry++ % 30) == 0) gtaDetectLang();
    gtaWheel.armHint.text = _root.gtaWheelArmory == 1 ? gtaTr("Planque - A : armurerie", "Safehouse - A: armory") : "";
+   gtaGarageHintTf.text = (_root.gtaGarageHint == undefined || _root.gtaArmOpen == 1) ? "" : _root.gtaGarageHint;
+   var fade = _root.gtaFade == undefined ? 0 : _root.gtaFade;
+   gtaFadeMc._alpha = fade;
+   gtaUpdateStats();
+   gtaFadeMc._visible = fade > 0;
    var open = _root.gtaArmOpen == 1;
    gtaArm._alpha = open ? 100 : 0;
+   gtaShopKeys._visible = open;
    if (!open) return;
-   gtaArm.title.text = gtaTr("Armurerie - ", "Armory - ") + _root.gtaArmTitle;
-   gtaArm.hint.text = _root.gtaArmHint == undefined ? "" : _root.gtaArmHint;
+   var garage = _root.gtaArmRaw == 1;
+   gtaArm.title.text = String(garage ? gtaTr("Atelier", "Workshop") : gtaTr("Armurerie", "Armory")).toUpperCase();
+   gtaArm.sub.text = String(_root.gtaArmTitle == undefined ? "" : _root.gtaArmTitle).toUpperCase();
+   gtaArm.hint.text = String(_root.gtaArmHint == undefined ? "" : _root.gtaArmHint).toUpperCase();
+   gtaShopKeys.tf.text = gtaTr("(A) SÉLECTION      (B) RETOUR", "(A) SELECT      (B) BACK");
+   gtaShopSel._visible = false;
    var rows = [_root.gtaArmR0, _root.gtaArmR1, _root.gtaArmR2, _root.gtaArmR3, _root.gtaArmR4,
                _root.gtaArmR5, _root.gtaArmR6, _root.gtaArmR7, _root.gtaArmR8];
    for (var i = 0; i < GTA_ARM_ROWS; i++) {
@@ -508,9 +675,12 @@ gtaArmCtl.onEnterFrame = function()
       r._visible = txt != "";
       r.label.text = txt;
       var sel = _root.gtaArmSel == i;
-      var c = new Color(r.bg);
-      c.setRGB(sel ? 0xFFFFFF : 0x202020);
-      r.bg._alpha = sel ? 95 : 70;
-      r.label.textColor = sel ? 0x111111 : 0xFFFFFF;
+      r.label.text = String(txt).toUpperCase();
+      r.label.textColor = sel ? 0xFFFFFF : 0xD8D8D8;
+      if (sel && txt != "") {
+         gtaShopSel._visible = true;
+         gtaShopSel._y = r._y;
+         gtaShopSel._width = Math.min(GTA_SHOP_W - 80, Math.max(310, r.label.textWidth + 70));
+      }
    }
 };

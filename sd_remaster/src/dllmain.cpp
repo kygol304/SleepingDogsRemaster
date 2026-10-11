@@ -18,6 +18,7 @@
 
 #include "newweapons.h"
 #include "graphics.h"
+#include "driving.h"
 
 namespace {
 
@@ -148,6 +149,8 @@ void WriteDefaultIni()
           "OffsetY=40\n"
           "; zoom minimum (plus grand = plus rapproche, evite les trous en voiture)\n"
           "MinZoom=1.05\n"
+          "; zoom minimum en plus en voiture (moins de trous a grande vitesse)\n"
+          "CarZoomBonus=0.25\n"
           "\n[Wheel]\n"
           "; roue d'arme : fleche gauche (manette) ou touche Key (clavier) maintenue, choix au stick droit / a la souris\n"
           "; ralenti pendant la roue (0.25 = 4x plus lent, 1 = pas de ralenti)\n"
@@ -179,6 +182,42 @@ void WriteDefaultIni()
           "Gain=1.0\n"
           "; barre au lancement (1 = pleine)\n"
           "Start=1.0\n"
+          "\n[Physics]\n"
+          "; reactions physiques : balle du joueur = le personnage encaisse (ragdoll alimente), impulsions des corps\n"
+          "Enabled=1\n"
+          "HitReact=1\n"
+          "HitImpulse=1.0\n"
+          "HitTime=0.6\n"
+          "HitWeight=1.0\n"
+          "DeathImpulse=1.5\n"
+          "\n[Driving]\n"
+          "; conduite realiste (x origine) : adherence, adherence arriere, roulis de la caisse, aides anti-tonneau,\n"
+          "; ressorts, amortisseurs, freinage artificiel des rotations, egalisation entre roues, couple de virage ajoute, freins\n"
+          "Enabled=1\n"
+          "Grip=0.92\n"
+          "RearGrip=0.95\n"
+          "BodyRoll=2.5\n"
+          "AntiRoll=0.5\n"
+          "Suspension=0.85\n"
+          "Damping=0.9\n"
+          "SpinDamping=0.6\n"
+          "Equalizer=0.5\n"
+          "ExtraTorque=0.5\n"
+          "Brakes=0.85\n"
+          "; bridage de vitesse du jeu (130 km/h d'origine sur toutes les voitures), x origine\n"
+          "TopSpeed=1.35\n"
+          "\n[Garages]\n"
+          "; ateliers de tuning (4 par defaut) : F11 en voiture en ajoute un a la position courante ; rayon en metres, taille de l'icone sur la carte\n"
+          "Radius=15\n"
+          "IconSize=20\n"
+          "\n[Nitro]\n"
+          "; nitro (voitures equipees au garage) : A (manette) ou Key (clavier) ; couple x Power, reservoir vide en Duration s, rempli en Recharge s\n"
+          "Key=N\n"
+          "Power=2.5\n"
+          "Duration=6\n"
+          "Recharge=25\n"
+          "; effet de vitesse : champ de vision pendant l'injection (x)\n"
+          "Fov=1.3\n"
           "\n[Rocket]\n"
           "; lance-roquettes : vitesse, chute, degats et rayon d'explosion (x origine), roquettes par chargeur\n"
           "Speed=3.0\n"
@@ -450,6 +489,11 @@ void FindChaseParams()
     }
 }
 
+float g_fovBoost = 1.f;          // champ de vision en conduite pendant la nitro (x)
+extern bool g_orbitOn;           // atelier du garage : caméra de vitrine
+extern float g_orbitAngle;
+float g_nitroFovBoost = 1.15f;   // [Nitro] Fov
+
 void ApplyChaseParams()
 {
     for (auto& cp : g_chaseParams) {
@@ -462,8 +506,19 @@ void ApplyChaseParams()
                 eye[i * 4 + 1] *= g_cfg.vehDistanceScale;
                 eye[i * 4 + 2] += g_cfg.vehHeight;          // hauteur
             }
-            fov[2] *= g_cfg.vehFovScale;  // fov à basse vitesse
-            fov[3] *= g_cfg.vehFovScale;  // fov à haute vitesse
+            fov[2] *= g_cfg.vehFovScale * g_fovBoost;  // fov à basse vitesse
+            fov[3] *= g_cfg.vehFovScale * g_fovBoost;  // fov à haute vitesse
+        }
+        if (g_orbitOn) {
+            // Atelier : l'œil tourne autour de la voiture (plan horizontal), un peu plus loin et plus haut.
+            for (int i = 0; i < 3; ++i) {
+                const float x = eye[i * 4 + 0], y = eye[i * 4 + 1];
+                const float r = sqrtf(x * x + y * y) * 1.25f;
+                const float a0 = atan2f(y, x) + g_orbitAngle;
+                eye[i * 4 + 0] = r * cosf(a0);
+                eye[i * 4 + 1] = r * sinf(a0);
+                eye[i * 4 + 2] += 0.35f;
+            }
         }
         DWORD old = 0;
         const bool unlocked = VirtualProtect(reinterpret_cast<void*>(cp.addr), kCP_Size, PAGE_READWRITE, &old) != 0;
@@ -592,6 +647,10 @@ float g_mapOrigX = 255.f, g_mapOrigY = 890.f;   // centre d'origine de la mini-c
 float g_mapDX = 0.f, g_mapDY = 0.f;              // décalage appliqué ([Minimap] OffsetX/Y)
 QuadDrawFn g_origQuad = nullptr;
 ClampFn g_origClamp = nullptr;
+// Repère de projection de la grande carte (octet +0x38 du calcul de rognage non nul), copié au passage
+// de ses icônes : les icônes garage y sont placées comme celles du jeu.
+uint8_t g_worldMapCtx[0x38] = {};
+std::atomic<ULONGLONG> g_worldMapCtxAt{0};
 TileFn g_origTiles = nullptr;
 
 void* MakeTrampoline(const uint8_t* stolen, uintptr_t resume)
@@ -689,11 +748,23 @@ ProjectFn g_origProject = nullptr;
 // Zoom minimum : en voiture le jeu dézoome jusqu'à ~0.68, et les 7 puces chargées autour
 // du joueur ne couvrent plus les coins du rectangle (trous). widget+0x18 = zoom, lu par la
 // projection des icônes, les zones et le rendu des rues.
+// En voiture (widget+0x1C), le jeu ajoute 0,5 au zoom et les puces chargées ne suivent plus à grande
+// vitesse : minimum relevé de [Minimap] CarZoomBonus.
+// Le zoom doit être corrigé avant que le jeu place quoi que ce soit (fait juste après la mise à jour
+// du HUD) : corrigé seulement au dessin du fond, les icônes et le trajet se calaient sur l'ancien zoom
+// (décalés loin du centre, recalés en s'approchant).
 float g_minZoom = 1.05f;
+float g_carZoomBonus = 0.25f;
+uint8_t* g_minimapWidget = nullptr;
+uint64_t g_minimapWidgetAt = 0;   // image du HUD où le fond de la mini-carte a été dessiné
+uint64_t g_hudFrame = 0;          // compteur d'images du HUD
+ULONGLONG g_iconTraceUntil = 0;   // relevé des icônes (F12)
+
 void ClampZoom(uint8_t* widget)
 {
     auto* z = reinterpret_cast<float*>(widget + 0x18);
-    if (*z > 0.1f && *z < g_minZoom) *z = g_minZoom;
+    const float minZ = g_minZoom + (widget[0x1C] ? g_carZoomBonus : 0.f);
+    if (*z > 0.1f && *z < minZ) *z = minZ;
 }
 
 __declspec(noinline) void __fastcall HookProject(float* out, float* in, float* ctx)
@@ -704,6 +775,46 @@ __declspec(noinline) void __fastcall HookProject(float* out, float* in, float* c
     const bool hudNew = ctx && fabsf(ctx[0] - g_mapOrigX - g_mapDX) < 8.f && fabsf(ctx[1] - g_mapOrigY - g_mapDY) < 8.f;
     if (hudOld || hudNew) ClampZoom(reinterpret_cast<uint8_t*>(ctx));
     g_origProject(out, in, ctx);
+    // Icônes de la mini-carte : le jeu les projette avec une copie du repère (widget+0x74) prise avant
+    // la correction du zoom (0,68 au lieu du minimum appliqué au fond) : elles se rapprochaient du
+    // centre et défilaient moins vite que les rues. Remises à l'échelle du fond, autour du point du
+    // repère qui tombe au centre de la carte (position du joueur en pixels de carte + décalage du jeu).
+    auto* iconGeo = g_minimapWidget ? g_minimapWidget + 0x74 : nullptr;
+    if (out && in && reinterpret_cast<uint8_t*>(ctx) == iconGeo && g_roundMinimap.load(std::memory_order_relaxed)) {
+        auto G = [](uintptr_t rva) { return *reinterpret_cast<float*>(g_base + rva); };
+        auto* raw = reinterpret_cast<uint8_t*>(ctx);
+        const float bonus = raw[0x1C] ? G(0x166C8FC) : 0.f;
+        const float minZ = g_minZoom + (raw[0x1C] ? g_carZoomBonus : 0.f);
+        const float zi = G(0x2173F10) + ctx[6] + bonus;
+        const float zb = G(0x2173F10) + (std::max)(ctx[6], minZ) + bonus;
+        const float a0 = G(0x21740A0), a4 = G(0x21740A4), a8 = G(0x21740A8), ac = G(0x21740AC);
+        const float b0 = G(0x21740B0), b4 = G(0x21740B4);
+        if (zi > 0.05f && zb > zi + 1e-4f && a4 != a0 && ac != a8) {
+            const float f = G(0x166C900) / (a4 - a0) * b0;
+            float c[2] = {
+                -b0 * a0 * G(0x166C900) / (a4 - a0) + f * ctx[2] + G(0x2173F14) - static_cast<float>(*reinterpret_cast<int*>(raw + 0x30)),
+                b4 * ac / (ac - a8) - f * ctx[3] + G(0x2173F18) - static_cast<float>(*reinterpret_cast<int*>(raw + 0x2C)) };
+            float pivot[2];
+            g_origProject(pivot, c, ctx);
+            const float s = zb / zi;
+            out[0] = pivot[0] + (out[0] - pivot[0]) * s;
+            out[1] = pivot[1] + (out[1] - pivot[1]) * s;
+            static std::atomic<int> logged{0};
+            if (logged.exchange(1) == 0)
+                LOG("minimap : icones remises au zoom du fond (%.2f -> %.2f), pivot %.1f %.1f", zi, zb, pivot[0], pivot[1]);
+        }
+    }
+    // Relevé (F12 en jeu) : 1 s des projections d'icônes de la mini-carte (entrée, position du repère, sortie).
+    if (g_iconTraceUntil && GetTickCount64() < g_iconTraceUntil && in && out && ctx) {
+        static uint64_t frame = 0;
+        static int n = 0;
+        if (frame != g_hudFrame) { frame = g_hudFrame; n = 0; }
+        if (n++ < 8)
+            LOG("icones f%llu %s : entree (%.1f %.1f) repere (%.1f %.1f | %.1f %.1f | %.3f %.3f %.3f) -> sortie (%.1f %.1f) appel jeu+0x%llX",
+                static_cast<unsigned long long>(g_hudFrame), hudOld ? "carte" : hudNew ? "carte2" : "autre", in[0], in[1],
+                ctx[0], ctx[1], ctx[2], ctx[3], ctx[4], ctx[5], ctx[6], out[0], out[1],
+                static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(_ReturnAddress()) - g_base));
+    }
     if (!out || !hudOld || (g_mapDX == 0.f && g_mapDY == 0.f)) return;
     // Seulement pour les icônes (appel depuis FUN_1400c6090) : les autres utilisateurs
     // de la projection (éléments Flash) se décalaient deux fois.
@@ -719,6 +830,10 @@ __declspec(noinline) void __fastcall HookClamp(
 {
     if (!g_origClamp) return;
     auto* raw = static_cast<unsigned char*>(math);
+    if (raw && raw[0x38] != 0 && ctx) {
+        memcpy(g_worldMapCtx, ctx, sizeof(g_worldMapCtx));
+        g_worldMapCtxAt.store(GetTickCount64(), std::memory_order_relaxed);
+    }
     const float radius = *reinterpret_cast<float*>(raw + 0x28);
     const bool hud = g_roundMinimap.load(std::memory_order_relaxed)
         && raw[0x38] == 0
@@ -804,6 +919,9 @@ using DrawTileRectsFn = void(__fastcall*)(
     void* view, float* entries, int count, float* color,
     uint32_t texture, uint32_t alphaState, uint32_t rasterState, float* matrix);
 
+void DrawGarageIcons(void* view, float k, float wx, float wy, float* color, uint32_t alphaState, uint32_t rasterState,
+                     float* matrix, DrawTileRectsFn draw);
+
 __declspec(noinline) void __fastcall HookTiles(
     void* widget, void* view, float* color,
     uint32_t alphaState, uint32_t rasterState, float* matrix)
@@ -816,7 +934,10 @@ __declspec(noinline) void __fastcall HookTiles(
     }
     auto G = [](uintptr_t rva) { return *reinterpret_cast<float*>(g_base + rva); };
     auto* w = static_cast<uint8_t*>(widget);
+    g_minimapWidget = w;
+    g_minimapWidgetAt = g_hudFrame;
     ClampZoom(w);
+
     float faded[4] = { 1.f, 1.f, 1.f, 1.f };
     if (color) {
         faded[0] = color[0]; faded[1] = color[1]; faded[2] = color[2]; faded[3] = color[3] * kTileAlpha;
@@ -847,6 +968,7 @@ __declspec(noinline) void __fastcall HookTiles(
         draw(view, e, 1, color, *reinterpret_cast<uint32_t*>(item + 0x80), alphaState, rasterState, matrix);
         ++drawn;
     }
+    DrawGarageIcons(view, k, wx, wy, color, alphaState, rasterState, matrix, draw);
     // Diagnostic de couverture (toutes les ~5 s) : étendue des puces autour du joueur,
     // avant zoom et rotation, et zoom courant (0x2173F10 + widget+0x18, +0.5 en voiture).
     static DWORD lastDiag = 0;
@@ -1010,6 +1132,8 @@ void InstallMinimap()
     char zbuf[32];
     GetPrivateProfileStringA("Minimap", "MinZoom", "1.05", zbuf, sizeof(zbuf), g_iniPath);
     g_minZoom = static_cast<float>(atof(zbuf));
+    GetPrivateProfileStringA("Minimap", "CarZoomBonus", "0.25", zbuf, sizeof(zbuf), g_iniPath);
+    g_carZoomBonus = static_cast<float>(atof(zbuf));
     const int dx = GetPrivateProfileIntA("Minimap", "OffsetX", -40, g_iniPath);
     const int dy = GetPrivateProfileIntA("Minimap", "OffsetY", 40, g_iniPath);
     auto* center = reinterpret_cast<float*>(g_base + 0x20341B8);
@@ -2096,6 +2220,9 @@ extern std::atomic<bool> g_lastInputKbm;
 constexpr WORD kPadWheel = 0x0200;      // RB : appui simulé pour que le jeu sorte l'arme rangée
 constexpr WORD kPadWheelKey = 0x0004;   // flèche gauche de la croix : roue (maintenue)
 constexpr WORD kPadFocusKey = 0x0008;   // flèche droite de la croix : focus (ralenti)
+extern std::atomic<bool> g_nitroCar;
+extern std::atomic<bool> g_garOpen;
+std::atomic<ULONGLONG> g_hudActiveAt{0};   // dernière mise à jour du HUD (en jeu)
 int WheelKey();
 extern std::atomic<bool> g_pickupFree, g_pickupUp;
 extern std::atomic<int> g_pickupPress;
@@ -2114,8 +2241,14 @@ DWORD WINAPI GameXInputGetState(DWORD user, PadState* st)
             || st->lt > 60 || st->rt > 60) g_lastInputKbm = false;
         if (ArmHoverActive()) st->buttons &= ~0x1000;   // A sur « ARMES » : pour le mod
         const ULONGLONG now = GetTickCount64();
-        st->buttons &= ~kPadWheelKey;   // flèche gauche : la roue
-        st->buttons &= ~kPadFocusKey;   // flèche droite : le focus
+        // Seulement en jeu (HUD mis à jour il y a moins de 150 ms) : sur la carte ou dans les menus du
+        // jeu, ces touches restent au jeu (A pose le point sur la carte).
+        const bool playing = now - g_hudActiveAt.load() < 150;
+        if (playing) {
+            st->buttons &= ~kPadWheelKey;   // flèche gauche : la roue
+            st->buttons &= ~kPadFocusKey;   // flèche droite : le focus
+            if (g_nitroCar.load()) st->buttons &= ~0x1000;   // A : la nitro (voiture équipée)
+        }
         {
             // RB pour ramasser avec une place libre : gardé jusqu'au relâchement (le mod range l'arme
             // tenue et rejoue l'appui, voir UpdatePickupFree).
@@ -2133,7 +2266,7 @@ DWORD WINAPI GameXInputGetState(DWORD user, PadState* st)
         // Menu ouvert : rien pour le jeu ; après fermeture, A / B restent bloqués jusqu'au relâchement
         // (sinon le B qui ferme le menu ferait aussi quitter la garde-robe).
         static bool holdAfterMenu = false;
-        if (g_armOpen.load()) { st->buttons = 0; st->lx = st->ly = st->rx = st->ry = 0; st->lt = st->rt = 0; holdAfterMenu = true; }
+        if (g_armOpen.load() || g_garOpen.load()) { st->buttons = 0; st->lx = st->ly = st->rx = st->ry = 0; st->lt = st->rt = 0; holdAfterMenu = true; }
         else if (holdAfterMenu) { if (st->buttons & 0x3000) st->buttons &= ~0x3000; else holdAfterMenu = false; }
     }
     return r;
@@ -2368,6 +2501,8 @@ void KeepRocketInfo(uint8_t* item)
 }
 // Nouvelles armes : leur modèle 3D (créé en mémoire au premier besoin) est posé sur l'objet de l'arme,
 // en main ou dans le sas, et les pièces d'origine sont gardées masquées.
+void UpdatePhysics();
+
 void KeepCustomModels()
 {
     static bool logSet = false;
@@ -2573,6 +2708,8 @@ bool IconReady(const char* icon)
 void PushPickupName(void* movie)
 {
     static std::string last = "?";
+    static void* seenMovie = nullptr;   // écran du HUD recréé : tout est renvoyé
+    if (movie != seenMovie) { seenMovie = movie; last = "?"; }
     std::string from, to, icon;
     if (WeaponDef* d = TargetedModWeapon()) {
         to = WeaponLabel(d);
@@ -3089,6 +3226,7 @@ void UpdateWardrobeArmory()
 WNDPROC g_origWndProc = nullptr;
 HWND g_gameWnd = nullptr;
 std::atomic<int> g_letKeys{0};                // messages clavier rejoués pour le jeu
+extern std::atomic<bool> g_garOpen;
 extern int g_focusVk;
 extern std::atomic<bool> g_pickupFree, g_pickupUp;
 extern std::atomic<int> g_pickupPress;
@@ -3113,6 +3251,8 @@ LRESULT CALLBACK ModWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp)
             --g_letKeys;
             return CallWindowProcW(g_origWndProc, w, msg, wp, lp);
         }
+        // Atelier du garage : aucune touche pour le jeu (la voiture reste en place).
+        if (msg != WM_CHAR && g_garOpen.load() && wp != VK_F4) return 0;
         // Touche du focus : pour le mod seulement.
         if (msg != WM_CHAR && static_cast<int>(wp) == g_focusVk) return 0;
         // R pour ramasser avec une place libre : gardé jusqu'au relâchement (voir UpdatePickupFree).
@@ -3125,12 +3265,12 @@ LRESULT CALLBACK ModWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp)
         }
         // Menu ARMES ouvert (ou sa ligne surlignée pour Entrée) : flèches, Entrée, Échap pour le mod
         // seulement, jusqu'au relâchement après la fermeture du menu.
-        if (msg != WM_CHAR && IsArmoryKey(wp) && (g_armOpen.load() || g_armKeysHeld.load() || (wp == VK_RETURN && ArmHoverActive()))) {
+        if (msg != WM_CHAR && IsArmoryKey(wp) && (g_armOpen.load() || g_garOpen.load() || g_armKeysHeld.load() || (wp == VK_RETURN && ArmHoverActive()))) {
             if (down) g_armKeysHeld = true;
-            else if (!g_armOpen.load()) g_armKeysHeld = false;
+            else if (!g_armOpen.load() && !g_garOpen.load()) g_armKeysHeld = false;
             return 0;
         }
-        if (msg == WM_CHAR && (wp == '\r' || wp == 27 || wp == 8) && (g_armOpen.load() || g_armKeysHeld.load())) return 0;
+        if (msg == WM_CHAR && (wp == '\r' || wp == 27 || wp == 8) && (g_armOpen.load() || g_garOpen.load() || g_armKeysHeld.load())) return 0;
         } else if (msg == WM_INPUT) {
         RAWINPUT ri{};
         UINT size = sizeof(ri);
@@ -3298,6 +3438,8 @@ void UpdateFocus(void* movie)
     if (movie) {
         static float shown = -1.f;
         static bool shownOn = false;
+        static void* seenMovie = nullptr;   // écran du HUD recréé : tout est renvoyé
+        if (HudMovieCached() != seenMovie) { seenMovie = HudMovieCached(); shown = -1.f; }
         if (fabsf(g_focus - shown) >= 0.005f || shownOn != g_focusOn) {
             shown = g_focus;
             shownOn = g_focusOn;
@@ -3305,6 +3447,480 @@ void UpdateFocus(void* movie)
             SetFlashNumber(movie, "_root.gtaFocusOn", g_focusOn ? 1 : 0);
         }
     }
+}
+
+// ---- Garages de tuning (façon Los Santos Customs) ---------------------------------------------
+// Positions dans [Garages] du .ini (4 par défaut, F11 en voiture en ajoute un), icône sur la
+// mini-carte. En voiture, à l'arrêt dans un garage (rayon [Garages] Radius), flèche gauche / C :
+// fondu au noir, la voiture reste en place, la caméra tourne lentement autour d'elle, et un menu à
+// droite propose les catégories (moteur, freins, adhérence, nitro, peinture) puis leurs options,
+// essayées en direct (B rend l'option d'avant, A la garde). Réglages gardés par modèle de véhicule
+// dans [Tuning] (moteur,freins,adhérence,nitro,peinture) et appliqués par driving.cpp.
+struct GaragePos { float x, y; };
+std::vector<GaragePos> g_garages;
+float g_garageRadius = 15.f;
+float g_garageIconSize = 20.f;
+extern float g_topSpeedMul;
+std::atomic<bool> g_garOpen{false};   // atelier en cours (fondus compris) : entrées retirées au jeu
+struct Tune { int engine = 0, brakes = 0, grip = 0; int nitro = 0; int paint = 0; };
+Tune g_garTune;            // réglages en cours (aperçu)
+Tune g_garSaved;           // réglages avant la catégorie ouverte
+char g_garModel[32] = "";
+enum class GarState { Closed, FadeIn, Menu, FadeOut };
+GarState g_garState = GarState::Closed;
+ULONGLONG g_garStateAt = 0;
+int g_garLevel = 0;        // 0 catégories, 1 options
+int g_garCat = 0;          // catégorie choisie
+int g_garIndex = 0;        // ligne surlignée
+bool g_orbitOn = false;    // caméra de vitrine (ApplyChaseParams)
+float g_orbitAngle = 0.f;
+void ApplyChaseParams();
+
+const float kTuneEngine[4] = { 1.f, 1.25f, 1.55f, 2.f };   // niveau enregistré dans [Tuning] (marqueur)
+const float kEngineVmax[4] = { 1.f, 1.2f, 1.45f, 1.75f };   // vitesse max du véhicule (x)
+const float kEngineAccel[4] = { 1.f, 1.1f, 1.2f, 1.3f };    // reprises (couple x, en plus de la boîte allongée)
+const float kNitroSeconds[4] = { 0.f, 2.f, 4.f, 6.f };       // durée d'injection par niveau
+const float kTuneBrakes[4] = { 1.f, 1.15f, 1.3f, 1.5f };
+const float kTuneGrip[4] = { 1.f, 1.05f, 1.1f, 1.18f };
+// Peinture : numéros de peinture du jeu (0 = « Origine » du mod, puis 0..15 du jeu).
+constexpr int kPaintCount = 33;   // « origine » + 32 peintures au plus (liste du modèle)
+constexpr int kGarCats = 6;   // moteur, freins, adhérence, nitro, peinture, quitter
+
+// Garages par défaut (devant les concessionnaires, enregistrés en jeu le 2026-10-11).
+const GaragePos kDefaultGarages[] = { { -1130.9f, 654.7f }, { 693.7f, 589.1f }, { 1634.2f, 323.4f }, { 1169.9f, -630.2f } };
+
+void LoadGarages()
+{
+    g_garages.clear();
+    const int n = GetPrivateProfileIntA("Garages", "Count", -1, g_iniPath);
+    if (n < 0) {
+        for (const auto& g : kDefaultGarages) g_garages.push_back(g);
+    } else {
+        for (int i = 0; i < n && i < 32; ++i) {
+            char key[16], buf[64];
+            sprintf_s(key, "G%d", i + 1);
+            GetPrivateProfileStringA("Garages", key, "", buf, sizeof(buf), g_iniPath);
+            GaragePos g{};
+            if (sscanf_s(buf, "%f,%f", &g.x, &g.y) == 2) g_garages.push_back(g);
+        }
+    }
+    char buf[32];
+    GetPrivateProfileStringA("Garages", "Radius", "15", buf, sizeof(buf), g_iniPath);
+    g_garageRadius = static_cast<float>(atof(buf));
+    GetPrivateProfileStringA("Garages", "IconSize", "20", buf, sizeof(buf), g_iniPath);
+    g_garageIconSize = static_cast<float>(atof(buf));
+    LOG("garages : %zu garage(s)%s, rayon %.0f m (F11 en voiture pour en ajouter un)", g_garages.size(), n < 0 ? " par defaut" : "", g_garageRadius);
+}
+
+void ReloadGaragesIfChanged()
+{
+    static ULONGLONG next = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (now < next) return;
+    next = now + 2000;
+    const int n = GetPrivateProfileIntA("Garages", "Count", -1, g_iniPath);
+    if (n >= 0 && n != static_cast<int>(g_garages.size())) LoadGarages();
+}
+
+bool InGarage()
+{
+    ReloadGaragesIfChanged();
+    if (!g_playerKnown.load() || !*drv::CurrentModel()) return false;
+    const float x = g_playerX.load(), y = g_playerY.load();
+    for (const auto& g : g_garages) {
+        const float dx = x - g.x, dy = y - g.y;
+        if (dx * dx + dy * dy < g_garageRadius * g_garageRadius) return true;
+    }
+    return false;
+}
+
+void RecordGarage()
+{
+    if (!g_playerKnown.load()) { LOG("garages : position du joueur inconnue"); return; }
+    // Première fois : la liste par défaut devient celle du .ini, puis on ajoute.
+    if (GetPrivateProfileIntA("Garages", "Count", -1, g_iniPath) < 0) {
+        for (size_t i = 0; i < g_garages.size(); ++i) {
+            char key[16], val[64];
+            sprintf_s(key, "G%zu", i + 1);
+            sprintf_s(val, "%.1f,%.1f", g_garages[i].x, g_garages[i].y);
+            WritePrivateProfileStringA("Garages", key, val, g_iniPath);
+        }
+    }
+    g_garages.push_back({ g_playerX.load(), g_playerY.load() });
+    char key[16], val[64], cnt[16];
+    sprintf_s(key, "G%d", static_cast<int>(g_garages.size()));
+    sprintf_s(val, "%.1f,%.1f", g_playerX.load(), g_playerY.load());
+    sprintf_s(cnt, "%d", static_cast<int>(g_garages.size()));
+    WritePrivateProfileStringA("Garages", key, val, g_iniPath);
+    WritePrivateProfileStringA("Garages", "Count", cnt, g_iniPath);
+    LOG("garages : garage %s enregistre en (%s)", key, val);
+}
+
+// Icônes des garages sur la mini-carte : dessinées avec les puces du fond (même repère, même
+// rotation), texture du mod SKR_Icon_Garage.
+void DrawGarageIcons(void* view, float k, float wx, float wy, float* color, uint32_t alphaState, uint32_t rasterState,
+                     float* matrix, DrawTileRectsFn draw)
+{
+    static uint32_t uid = 0;
+    if (!uid) {
+        const std::string png = ModFile("SKR_Icon_Garage", ".png");
+        if (nw::IconState("SKR_Icon_Garage", png.c_str()) != 2) return;   // texture pas encore prête
+        uid = nw::IconUid("SKR_Icon_Garage");
+        if (!uid) return;
+    }
+    float white[4] = { 1.f, 1.f, 1.f, color ? color[3] / kTileAlpha : 1.f };
+    const float half = g_garageIconSize * 0.5f;
+    for (const auto& g : g_garages) {
+        const float cx = k * (g.x - wx), cy = -k * (g.y - wy);
+        if (fabsf(cx) > 2000.f || fabsf(cy) > 2000.f) continue;
+        float e[10] = { cx - half, 0.f, cx + half, 1.f, cy - half, 0.f, cy + half, 1.f, 0.f, 0.f };
+        draw(view, e, 1, white, uid, alphaState, rasterState, matrix);
+    }
+}
+
+// Grande carte (écran de pause) : FUN_1406011d0 (écran, vue) dessine ses icônes (liste +0xD50, nombre
+// +0xD48, 0x50 octets chacune : texture, UV +0x10, taille +0x20 x +0x34, position +0x24/+0x28 dans le
+// repère de la carte, matrice +0xD58). Les garages y sont ajoutés, projetés avec le repère des icônes
+// du jeu (relevé dans HookClamp), même calcul que la mini-carte (FUN_1400cdc20).
+constexpr uintptr_t kWorldMapBlipsRva = 0x6011D0;
+const uint8_t kWorldMapBlipsPro[19] = { 0x4C,0x8B,0xDC,0x49,0x89,0x5B,0x10,0x49,0x89,0x73,0x18,0x57,0x48,0x81,0xEC,0x10,0x01,0x00,0x00 };
+using WorldMapBlipsFn = void(__fastcall*)(void* screen, void* view);
+WorldMapBlipsFn g_origWorldMapBlips = nullptr;
+float g_worldMapIconSize = 30.f;
+
+__declspec(noinline) void __fastcall HookWorldMapBlips(void* screen, void* view)
+{
+    if (!g_origWorldMapBlips) return;
+    g_origWorldMapBlips(screen, view);
+    if (!g_origQuad || !g_origProject || g_garages.empty()) return;
+
+    static uint32_t uid = 0;
+    if (!uid) {
+        const std::string png = ModFile("SKR_Icon_Garage", ".png");
+        if (nw::IconState("SKR_Icon_Garage", png.c_str()) != 2) return;
+        uid = nw::IconUid("SKR_Icon_Garage");
+        if (!uid) return;
+    }
+    auto G = [](uintptr_t rva) { return *reinterpret_cast<float*>(g_base + rva); };
+    const float a0 = G(0x21740A0), a4 = G(0x21740A4), a8 = G(0x21740A8), ac = G(0x21740AC);
+    const float b0 = G(0x21740B0), b4 = G(0x21740B4);
+    if (a4 == a0 || ac == a8) return;
+    // Repère : celui des icônes du jeu s'il vient d'être relevé, sinon la copie rangée dans l'écran de la
+    // carte (+0x590, relevée identique) : les garages s'affichent dès l'ouverture de la carte.
+    uint8_t ctx[0x38];
+    if (GetTickCount64() - g_worldMapCtxAt.load(std::memory_order_relaxed) <= 1000) memcpy(ctx, g_worldMapCtx, sizeof(ctx));
+    else memcpy(ctx, static_cast<uint8_t*>(screen) + 0x590, sizeof(ctx));
+    const float u = G(0x166C900) / (a4 - a0);
+    const float f = u * b0;
+    const int ox = *reinterpret_cast<int*>(ctx + 0x30), oy = *reinterpret_cast<int*>(ctx + 0x2C);
+    auto* scr = static_cast<uint8_t*>(screen);
+    float* matrix = reinterpret_cast<float*>(scr + 0xD58);
+    float white[4] = { 1.f, 1.f, 1.f, 1.f };
+    static const float uv[4] = { 0.f, 0.f, 1.f, 1.f };
+    const float half = g_worldMapIconSize * 0.5f;
+    for (const auto& g : g_garages) {
+        float in[2] = { -b0 * a0 * u + f * g.x - static_cast<float>(ox), b4 * ac / (ac - a8) - f * g.y - static_cast<float>(oy) };
+        float out[2];
+        g_origProject(out, in, reinterpret_cast<float*>(ctx));
+        g_origQuad(view, out[0] - half, out[1] - half, g_worldMapIconSize, g_worldMapIconSize, white, uid,
+                   reinterpret_cast<uint64_t>(uv), kAlphaModulated, 0x62F81854, matrix);
+    }
+    static std::atomic<int> logged{0};
+    if (logged.exchange(1) == 0) {
+        float in[2] = { -b0 * a0 * u + f * g_garages[0].x - static_cast<float>(ox), b4 * ac / (ac - a8) - f * g_garages[0].y - static_cast<float>(oy) };
+        float out[2];
+        g_origProject(out, in, reinterpret_cast<float*>(ctx));
+        const uint32_t n = *reinterpret_cast<uint32_t*>(scr + 0xD48);
+        auto* q = *reinterpret_cast<float**>(scr + 0xD50);
+        LOG("garages : %zu icone(s) sur la grande carte ; garage 1 en (%.1f %.1f) ; %u icones du jeu, 1re en (%.1f %.1f) taille %.1f",
+            g_garages.size(), out[0], out[1], n, n && q ? q[9] : 0.f, n && q ? q[10] : 0.f, n && q ? q[8] * q[0xD] : 0.f);
+        // Où le repère est rangé dans l'écran de la carte (pour le lire sans attendre les icônes du jeu).
+    }
+}
+
+int LevelOf(const float* table, float v)
+{
+    int best = 0;
+    for (int i = 1; i < 4; ++i) if (fabsf(table[i] - v) < fabsf(table[best] - v)) best = i;
+    return best;
+}
+
+// Réglages du modèle conduit, lus dans [Tuning].
+Tune ReadTune(const char* model)
+{
+    Tune t;
+    char buf[128];
+    GetPrivateProfileStringA("Tuning", model, "", buf, sizeof(buf), g_iniPath);
+    float e = 1.f, b = 1.f, g = 1.f;
+    int nitro = 0, paintId = -1;
+    if (buf[0] && sscanf_s(buf, "%f,%f,%f,%d,%d", &e, &b, &g, &nitro, &paintId) >= 4) {
+        if (std::count(buf, buf + strlen(buf), ',') >= 6) paintId = -1;   // ancien essai r,g,b
+        t.engine = LevelOf(kTuneEngine, e);
+        t.brakes = LevelOf(kTuneBrakes, b);
+        t.grip = LevelOf(kTuneGrip, g);
+        t.nitro = (std::max)(0, (std::min)(3, nitro));
+        t.paint = paintId >= 0 && paintId < kPaintCount - 1 ? paintId + 1 : 0;
+    }
+    return t;
+}
+
+void WriteTune(const char* model, const Tune& t)
+{
+    char buf[128];
+    sprintf_s(buf, "%.2f,%.2f,%.2f,%d,%d", kTuneEngine[t.engine], kTuneBrakes[t.brakes], kTuneGrip[t.grip],
+              t.nitro, t.paint - 1);
+    WritePrivateProfileStringA("Tuning", model, buf, g_iniPath);
+}
+
+const char* CatName(int c)
+{
+    switch (c) {
+    case 0: return Tr("Moteur", "Engine");
+    case 1: return Tr("Freins", "Brakes");
+    case 2: return Tr("Adherence", "Grip");
+    case 3: return Tr("Nitro", "Nitro");
+    case 4: return Tr("Peinture", "Paint");
+    default: return Tr("Quitter l'atelier", "Leave the shop");
+    }
+}
+
+int OptionCount(int c) { return c <= 3 ? 4 : (std::min)(kPaintCount, drv::PaletteCount() + 1); }
+
+int& TuneField(Tune& t, int c)
+{
+    static int nitroTmp = 0;
+    switch (c) {
+    case 0: return t.engine;
+    case 1: return t.brakes;
+    case 2: return t.grip;
+    case 3: return t.nitro;
+    case 4: return t.paint;
+    default: return nitroTmp;
+    }
+}
+
+int TuneValue(const Tune& t, int c) { return TuneField(const_cast<Tune&>(t), c); }
+
+void SetTuneValue(Tune& t, int c, int v) { TuneField(t, c) = v; }
+
+void OptionLabel(int c, int i, char* out, size_t n)
+{
+    static const char* pct[3][4] = { { "", "VMax x1,2", "VMax x1,45", "VMax x1,75" }, { "", "+15 %", "+30 %", "+50 %" }, { "", "+5 %", "+10 %", "+18 %" } };
+    if (c <= 2) {
+        if (i == 0) snprintf(out, n, "%s", Tr("Origine", "Stock"));
+        else snprintf(out, n, "%s %d   %s", Tr("Niveau", "Level"), i, pct[c][i]);
+    } else if (c == 3) {
+        if (i == 0) snprintf(out, n, "%s", Tr("Sans nitro", "No nitro"));
+        else snprintf(out, n, "%s %d   %.0f s", Tr("Nitro niveau", "Nitro level"), i, kNitroSeconds[i]);
+    } else {
+        if (i == 0) snprintf(out, n, "%s", Tr("Peinture d'origine", "Stock paint"));
+        else snprintf(out, n, "%s", drv::PaletteName(i - 1, g_langFr.load()));
+    }
+}
+
+void PushGarageStats(void* movie);
+
+void PushGarage()
+{
+    void* movie = HudMovieCached();
+    if (!movie) return;
+    const bool menu = g_garState == GarState::Menu;
+    SetFlashNumber(movie, "_root.gtaArmOpen", menu ? 1 : 0);
+    SetFlashNumber(movie, "_root.gtaStatShow", menu ? 1 : 0);
+    if (menu) PushGarageStats(movie);
+    SetFlashNumber(movie, "_root.gtaArmRaw", g_garState != GarState::Closed ? 1 : 0);
+    if (!menu) return;
+    char title[96];
+    if (g_garLevel == 0) sprintf_s(title, "%s - %s", Tr("Atelier", "Workshop"), *drv::CurrentModelName() ? drv::CurrentModelName() : "?");
+    else sprintf_s(title, "%s", CatName(g_garCat));
+    SetFlashString(movie, "_root.gtaArmTitle", title);
+    const bool kbm = UsingKbm();
+    SetFlashString(movie, "_root.gtaArmHint", g_garLevel == 0
+        ? (kbm ? Tr("Entree : choisir     Echap : quitter", "Enter: select     Esc: leave") : Tr("A : choisir     B : quitter", "A: select     B: leave"))
+        : (kbm ? Tr("Entree : installer     Echap : retour", "Enter: install     Esc: back") : Tr("A : installer     B : retour", "A: install     B: back")));
+    constexpr int kRows = 9;
+    char rows[kRows][128] = {};
+    int count = 0, top = 0;
+    if (g_garLevel == 0) {
+        count = kGarCats;
+        for (int r = 0; r < count; ++r) {
+            if (r < 5) {
+                char opt[64];
+                OptionLabel(r, TuneValue(g_garTune, r), opt, sizeof(opt));
+                sprintf_s(rows[r], "%s : %s", CatName(r), opt);
+            } else {
+                sprintf_s(rows[r], "%s", CatName(r));
+            }
+        }
+    } else {
+        count = OptionCount(g_garCat);
+        top = g_garIndex - kRows / 2;
+        if (top > count - kRows) top = count - kRows;
+        if (top < 0) top = 0;
+        const int installed = TuneValue(g_garSaved, g_garCat);
+        for (int r = 0; r < kRows && top + r < count; ++r) {
+            char opt[64];
+            OptionLabel(g_garCat, top + r, opt, sizeof(opt));
+            sprintf_s(rows[r], "%s%s", opt, top + r == installed ? Tr("   (installe)", "   (installed)") : "");
+        }
+    }
+    for (int r = 0; r < kRows; ++r) {
+        char path[48];
+        sprintf_s(path, "_root.gtaArmR%d", r);
+        SetFlashString(movie, path, rows[r]);
+    }
+    SetFlashNumber(movie, "_root.gtaArmSel", g_garIndex - top);
+}
+
+// Statistiques de l'atelier : installé (avant) et essayé (après).
+void PushGarageStats(void* movie)
+{
+    const float base = drv::BaseVmaxKmh() > 0.f ? drv::BaseVmaxKmh() : 130.f * g_topSpeedMul;
+    auto vmax = [&](const Tune& t) { return base * kEngineVmax[t.engine]; };
+    const Tune& a = g_garSaved;
+    const Tune& b = g_garTune;
+    const float va = vmax(a), vb = vmax(b);
+    const float A[4] = { va / 360.f, 0.4f + (kEngineAccel[a.engine] - 1.f) * 1.8f, 0.45f + (kTuneBrakes[a.brakes] - 1.f), 0.5f + (kTuneGrip[a.grip] - 1.f) * 2.5f };
+    const float B[4] = { vb / 360.f, 0.4f + (kEngineAccel[b.engine] - 1.f) * 1.8f, 0.45f + (kTuneBrakes[b.brakes] - 1.f), 0.5f + (kTuneGrip[b.grip] - 1.f) * 2.5f };
+    char vlabel[64];
+    if (static_cast<int>(va + 0.5f) == static_cast<int>(vb + 0.5f)) sprintf_s(vlabel, "%s : %.0f km/h", Tr("Vitesse max", "Top speed"), vb);
+    else sprintf_s(vlabel, "%s : %.0f -> %.0f km/h", Tr("Vitesse max", "Top speed"), va, vb);
+    const char* labels[4] = { vlabel, Tr("Acceleration", "Acceleration"), Tr("Freinage", "Braking"), Tr("Adherence", "Grip") };
+    for (int i = 0; i < 4; ++i) {
+        char path[32];
+        sprintf_s(path, "_root.gtaStatL%d", i);
+        SetFlashString(movie, path, labels[i]);
+        sprintf_s(path, "_root.gtaStatA%d", i);
+        SetFlashNumber(movie, path, A[i]);
+        sprintf_s(path, "_root.gtaStatB%d", i);
+        SetFlashNumber(movie, path, B[i]);
+    }
+}
+
+void SetFade(float a)
+{
+    if (void* movie = HudMovieCached()) SetFlashNumber(movie, "_root.gtaFade", a);
+}
+
+void OpenGarage()
+{
+    if (drv::CurrentSpeedKmh() > 12.f) { LOG("garages : trop vite pour entrer (%.0f km/h)", drv::CurrentSpeedKmh()); return; }
+    snprintf(g_garModel, sizeof(g_garModel), "%s", drv::CurrentModel());
+    g_garTune = ReadTune(g_garModel);
+    g_garSaved = g_garTune;
+    g_garLevel = 0;
+    g_garIndex = 0;
+    g_garOpen = true;
+    g_garState = GarState::FadeIn;
+    g_garStateAt = GetTickCount64();
+    LOG("garages : atelier pour %s (%s)", drv::CurrentModelName(), g_garModel);
+}
+
+void LeaveGarage()
+{
+    if (g_garState == GarState::Menu) { g_garState = GarState::FadeOut; g_garStateAt = GetTickCount64(); }
+}
+
+// Atelier : fondus, caméra de vitrine et menu. Vrai tant que l'atelier est actif.
+bool UpdateGarage(const PadState& pad, bool padOk)
+{
+    if (g_garState == GarState::Closed) return false;
+    const ULONGLONG now = GetTickCount64();
+    const float t = (now - g_garStateAt) / 1000.f;
+    const bool stillInCar = strcmp(g_garModel, drv::CurrentModel()) == 0;
+    if (g_garState == GarState::FadeIn) {
+        SetFade((std::min)(100.f, t / 0.35f * 100.f));
+        if (t >= 0.45f) {   // écran noir : mise en place de la vitrine
+            g_orbitOn = true;
+            g_orbitAngle = 0.6f;
+            ApplyChaseParams();
+            g_garState = GarState::Menu;
+            g_garStateAt = now;
+        }
+        PushGarage();
+        return true;
+    }
+    if (g_garState == GarState::FadeOut) {
+        if (t < 0.4f) SetFade((std::min)(100.f, t / 0.3f * 100.f));
+        else {
+            if (g_orbitOn) { g_orbitOn = false; ApplyChaseParams(); }
+            SetFade((std::max)(0.f, 100.f - (t - 0.4f) / 0.35f * 100.f));
+        }
+        if (t >= 0.8f) {
+            SetFade(0.f);
+            g_garState = GarState::Closed;
+            g_garOpen = false;
+            LOG("garages : sortie de l'atelier");
+        }
+        PushGarage();
+        return true;
+    }
+    // Menu : fondu d'ouverture, caméra qui tourne lentement.
+    SetFade((std::max)(0.f, 100.f - t / 0.4f * 100.f));
+    static ULONGLONG lastOrbit = now;
+    const float dt = (std::min)(0.1f, (now - lastOrbit) / 1000.f);
+    lastOrbit = now;
+    g_orbitAngle += dt * 0.25f;
+    ApplyChaseParams();
+    if (!stillInCar) { LeaveGarage(); PushGarage(); return true; }
+
+    static bool was[5] = { true, true, true, true, true };
+    static bool okWas = true;
+    static ULONGLONG repeatAt = 0;
+    const WORD b = padOk ? pad.buttons : 0;
+    const bool fg = g_gameWnd && GetForegroundWindow() == g_gameWnd;
+    auto key = [&](int vk) { return fg && (GetAsyncKeyState(vk) & 0x8000); };
+    const bool held[5] = {
+        (b & 0x0001) || (padOk && pad.ly > 16000) || key(VK_UP),
+        (b & 0x0002) || (padOk && pad.ly < -16000) || key(VK_DOWN),
+        false, false,
+        (b & 0x2000) || key(VK_ESCAPE) || key(VK_BACK),
+    };
+    const bool ok = (b & 0x1000) || key(VK_RETURN);
+    bool press[5];
+    for (int i = 0; i < 5; ++i) {
+        press[i] = held[i] && (!was[i] || (i < 2 && now >= repeatAt));
+        if (press[i] && i < 2) repeatAt = now + (was[i] ? 110 : 360);
+        was[i] = held[i];
+    }
+    const bool okPress = ok && !okWas;
+    okWas = ok;
+    const int count = g_garLevel == 0 ? kGarCats : OptionCount(g_garCat);
+    const int before = g_garIndex;
+    if (press[0]) g_garIndex = (g_garIndex + count - 1) % count;
+    if (press[1]) g_garIndex = (g_garIndex + 1) % count;
+    if (g_garLevel == 1 && g_garIndex != before) {
+        // Aperçu en direct de l'option surlignée.
+        SetTuneValue(g_garTune, g_garCat, g_garIndex);
+        WriteTune(g_garModel, g_garTune);
+    }
+    if (okPress) {
+        if (g_garLevel == 0) {
+            if (g_garIndex == kGarCats - 1) LeaveGarage();
+            else {
+                g_garCat = g_garIndex;
+                g_garLevel = 1;
+                g_garSaved = g_garTune;
+                g_garIndex = TuneValue(g_garTune, g_garCat);
+            }
+        } else {
+            g_garSaved = g_garTune;   // installé
+            LOG("garages : %s %s -> %d", g_garModel, CatName(g_garCat), g_garIndex);
+            g_garLevel = 0;
+            g_garIndex = g_garCat;
+        }
+    } else if (press[4]) {
+        if (g_garLevel == 1) {
+            g_garTune = g_garSaved;   // l'option essayée est rendue
+            WriteTune(g_garModel, g_garTune);
+            g_garLevel = 0;
+            g_garIndex = g_garCat;
+        } else {
+            LeaveGarage();
+        }
+    }
+    PushGarage();
+    return true;
 }
 
 void UpdateWheel(void* hud)
@@ -3322,6 +3938,29 @@ void UpdateWheel(void* hud)
     void* movie = HudMovie(hud);
     g_hudMovie = movie;
     if (g_armOpen.load() && g_armMovie == movie) { UpdateArmory(pad, padOk); PushWheel(movie, false); return; }
+    // Garage de tuning : menu ouvert, ou touche de la roue en voiture dans un garage.
+    static bool garWas = true;
+    if (UpdateGarage(pad, padOk)) { garWas = true; PushWheel(movie, false); return; }
+    const bool inGarage = InGarage();
+    if (movie) {
+        static int hintShown = -1;
+        static void* seenMovie = nullptr;   // écran du HUD recréé : tout est renvoyé
+        if (HudMovieCached() != seenMovie) { seenMovie = HudMovieCached(); hintShown = -1; }
+        const int hintNow = inGarage ? (UsingKbm() ? 2 : 1) : 0;
+        if (hintShown != hintNow) {
+            hintShown = hintNow;
+            SetFlashString(movie, "_root.gtaGarageHint", !inGarage ? "" : UsingKbm() ? Tr("Atelier de tuning : C (a l'arret)", "Tuning shop: C (stopped)")
+                                                                                     : Tr("Atelier de tuning : fleche gauche (a l'arret)", "Tuning shop: D-pad left (stopped)"));
+        }
+    }
+    if (inGarage) {
+        if (held && !garWas) OpenGarage();
+        garWas = held;
+        if (movie) SetFlashNumber(movie, "_root.gtaArmOpen", 0);
+        PushWheel(movie, false);
+        return;
+    }
+    garWas = held;
     if (movie) SetFlashNumber(movie, "_root.gtaArmOpen", 0);
     if (!held && !wasOpen) PushWheel(movie, false);   // préchargement des icônes
     if (held) {
@@ -3439,6 +4078,155 @@ void UpdateGraphics()
     gfx::Update(gs);
 }
 
+// ---- Nitro ------------------------------------------------------------------------------------
+// Voiture équipée (garage) : A (manette, retiré au jeu dans cette voiture : plus de saut vers un autre
+// véhicule) ou [Nitro] Key (clavier) maintenu. Réservoir vidé en [Nitro] Duration s, rempli en
+// [Nitro] Recharge s ; couple x [Nitro] Power et vitesse de pointe relevée pendant l'injection.
+std::atomic<bool> g_nitroCar{false};   // voiture équipée conduite : A retiré au jeu
+float g_nitroFuel = 1.f;
+
+void UpdateNitro(bool equipped, float levelSeconds)
+{
+    static float power = 2.5f, duration = 4.f, recharge = 25.f;
+    static int vk = 'N';
+    static bool init = false;
+    if (!init) {
+        init = true;
+        char buf[32];
+        GetPrivateProfileStringA("Nitro", "Power", "2.5", buf, sizeof(buf), g_iniPath);
+        power = static_cast<float>(atof(buf));
+        GetPrivateProfileStringA("Nitro", "Duration", "6", buf, sizeof(buf), g_iniPath);
+        duration = (std::max)(0.5f, static_cast<float>(atof(buf)));
+        GetPrivateProfileStringA("Nitro", "Recharge", "25", buf, sizeof(buf), g_iniPath);
+        recharge = (std::max)(1.f, static_cast<float>(atof(buf)));
+        drv::SetFlameSource(GetPrivateProfileIntA("Nitro", "FlameEffect", 20, g_iniPath));
+        GetPrivateProfileStringA("Nitro", "Fov", "1.3", buf, sizeof(buf), g_iniPath);
+        g_nitroFovBoost = static_cast<float>(atof(buf));
+        GetPrivateProfileStringA("Nitro", "Key", "N", buf, sizeof(buf), g_iniPath);
+        const char c = static_cast<char>(toupper(static_cast<unsigned char>(buf[0])));
+        vk = (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ? c : 'N';
+    }
+    g_nitroCar = equipped;
+    if (levelSeconds > 0.f) duration = levelSeconds;   // niveau de nitro de l'atelier
+    const ULONGLONG now = GetTickCount64();
+    static ULONGLONG last = now;
+    const float dt = (std::min)(0.25f, (now - last) / 1000.f);
+    last = now;
+    PadState pad{};
+    const bool padOk = ReadPad(pad);
+    const bool menu = g_garOpen.load() || g_armOpen.load();   // A sert au menu
+    const bool held = equipped && !menu && ((padOk && (pad.buttons & 0x1000))
+                   || (g_gameWnd && GetForegroundWindow() == g_gameWnd && (GetAsyncKeyState(vk) & 0x8000)));
+    static bool on = false;
+    if (held && g_nitroFuel > (on ? 0.f : 0.1f)) {
+        g_nitroFuel = (std::max)(0.f, g_nitroFuel - dt / duration);
+        if (!on) LOG("nitro : injection (reservoir %.0f %%)", g_nitroFuel * 100.f);
+        on = g_nitroFuel > 0.f;
+    } else {
+        if (on) LOG("nitro : fin (reservoir %.0f %%)", g_nitroFuel * 100.f);
+        on = false;
+        g_nitroFuel = (std::min)(1.f, g_nitroFuel + dt / recharge);
+    }
+    drv::SetBoost(on, power);
+    drv::SetNitroFlames(on);
+    // Effet de vitesse : champ de vision de la caméra de conduite élargi pendant l'injection.
+    {
+        const float target = on ? g_nitroFovBoost : 1.f;
+        const float next = g_fovBoost + (target - g_fovBoost) * (std::min)(1.f, dt * (on ? 4.f : 2.5f));
+        if (fabsf(next - g_fovBoost) > 0.002f || (target == 1.f && g_fovBoost != 1.f && fabsf(next - 1.f) <= 0.002f)) {
+            g_fovBoost = fabsf(next - 1.f) <= 0.002f && target == 1.f ? 1.f : next;
+            ApplyChaseParams();
+        }
+    }
+    if (void* movie = HudMovieCached()) {
+        static int shownSpeed = -1;
+        const int speed = *drv::CurrentModel() ? static_cast<int>(drv::CurrentSpeedKmh() + 0.5f) : -1;
+        if (speed != shownSpeed) { shownSpeed = speed; SetFlashNumber(movie, "_root.gtaSpeed", speed); }
+        static float shown = -1.f;
+        static int shownState = -1;
+        static void* seenMovie = nullptr;   // écran du HUD recréé : tout est renvoyé
+        if (HudMovieCached() != seenMovie) { seenMovie = HudMovieCached(); shownSpeed = -1; shown = -1.f; }
+        const int state = !equipped ? 0 : (on ? 2 : 1);
+        if (fabsf(g_nitroFuel - shown) >= 0.005f || state != shownState) {
+            shown = g_nitroFuel;
+            shownState = state;
+            SetFlashNumber(movie, "_root.gtaNitro", g_nitroFuel);
+            SetFlashNumber(movie, "_root.gtaNitroState", state);
+        }
+    }
+}
+
+float g_topSpeedMul = 1.35f;   // [Driving] TopSpeed (statistiques de l'atelier)
+
+bool SameDriving(const drv::Settings& a, const drv::Settings& b)
+{
+    return a.enabled == b.enabled && a.grip == b.grip && a.rearGrip == b.rearGrip && a.bodyRoll == b.bodyRoll
+        && a.antiRoll == b.antiRoll && a.suspension == b.suspension && a.damping == b.damping && a.spinDamping == b.spinDamping
+        && a.equalizer == b.equalizer && a.extraTorque == b.extraTorque && a.brakes == b.brakes && a.topSpeed == b.topSpeed && a.engine == b.engine
+        && a.tuneBrakes == b.tuneBrakes && a.tuneGrip == b.tuneGrip && a.nitro == b.nitro && a.nitroLevel == b.nitroLevel && a.vmaxMul == b.vmaxMul
+        && a.paintId == b.paintId && strcmp(a.forModel, b.forModel) == 0;
+}
+
+// Conduite réaliste ([Driving] du .ini, relu chaque seconde : réglable en roulant ; un changement
+// remet le véhicule à l'origine puis le règle de nouveau).
+void UpdateDriving()
+{
+    static drv::Settings ds;
+    static ULONGLONG nextRead = 0;
+    const ULONGLONG now = GetTickCount64();
+    bool changed = false;
+    if (strcmp(drv::CurrentModel(), ds.forModel) != 0) nextRead = 0;   // autre véhicule : tuning relu tout de suite
+    if (now >= nextRead) {
+        nextRead = now + 1000;
+        static bool logSet = false;
+        if (!logSet) { logSet = true; drv::SetLog([](const char* m) { LOG("%s", m); }); }
+        auto f = [](const char* key, const char* def) {
+            char buf[32];
+            GetPrivateProfileStringA("Driving", key, def, buf, sizeof(buf), g_iniPath);
+            return static_cast<float>(atof(buf));
+        };
+        drv::Settings n;
+        n.enabled = GetPrivateProfileIntA("Driving", "Enabled", 1, g_iniPath) != 0;
+        n.grip = f("Grip", "0.92");
+        n.rearGrip = f("RearGrip", "0.95");
+        n.bodyRoll = f("BodyRoll", "2.5");
+        n.antiRoll = f("AntiRoll", "0.5");
+        n.suspension = f("Suspension", "0.85");
+        n.damping = f("Damping", "0.9");
+        n.spinDamping = f("SpinDamping", "0.6");
+        n.equalizer = f("Equalizer", "0.5");
+        n.extraTorque = f("ExtraTorque", "0.5");
+        n.brakes = f("Brakes", "0.85");
+        n.topSpeed = f("TopSpeed", "1.35");
+        g_topSpeedMul = n.topSpeed;
+        // Tuning du modèle conduit : [Tuning] <modèle>=moteur,freins,adherence,nitro,r,g,b
+        if (const char* model = drv::CurrentModel(); *model) {
+            snprintf(n.forModel, sizeof(n.forModel), "%s", model);
+            char buf[128];
+            GetPrivateProfileStringA("Tuning", model, "", buf, sizeof(buf), g_iniPath);
+            if (!buf[0]) GetPrivateProfileStringA("Tuning", "Default", "", buf, sizeof(buf), g_iniPath);
+            float e = 1.f, b = 1.f, g = 1.f;
+            int nitro = 0, paint = -1;
+            const bool oldFormat = std::count(buf, buf + strlen(buf), ',') >= 6;   // ancien essai r,g,b : ignoré
+            if (buf[0] && sscanf_s(buf, "%f,%f,%f,%d,%d", &e, &b, &g, &nitro, &paint) >= 4) {
+                if (oldFormat) paint = -1;
+                const int lv = LevelOf(kTuneEngine, e);
+                n.vmaxMul = kEngineVmax[lv];
+                n.engine = kEngineAccel[lv] * kEngineVmax[lv];   // couple : la boîte allongée le divise d'autant
+                n.tuneBrakes = b; n.tuneGrip = g;
+                n.nitroLevel = (std::max)(0, (std::min)(3, nitro));
+                n.nitro = n.nitroLevel > 0;
+                n.paintId = paint;
+            }
+        }
+        changed = !SameDriving(n, ds);
+        ds = n;
+    }
+    if (changed) drv::Update(nullptr, ds);   // remet à l'origine, réglé de nouveau à l'image suivante
+    UpdateNitro(ds.nitro && *drv::CurrentModel(), kNitroSeconds[(std::max)(0, (std::min)(3, ds.nitroLevel))]);
+    drv::Update(Player(), ds);
+}
+
 void ReportPerf()
 {
     static LARGE_INTEGER freq{}, last{};
@@ -3467,9 +4255,18 @@ void ReportPerf()
 __declspec(noinline) void __fastcall HookHudUpdate(void* hud)
 {
     g_origHudUpdate(hud);
+    g_hudActiveAt = GetTickCount64();
+    ++g_hudFrame;
+    // Zoom corrigé avant que le jeu place quoi que ce soit, seulement si le fond a été dessiné à l'image
+    // précédente (sinon le widget a pu être détruit : carte, menus).
+    if (g_minimapWidget && g_hudFrame - g_minimapWidgetAt <= 2 && g_roundMinimap.load(std::memory_order_relaxed)) ClampZoom(g_minimapWidget);
     ReportPerf();
     PerfScope perf(g_perf[kPerfHud]);
+    // Écran Flash du HUD de cette image : le jeu le recrée (sortie de la carte, des menus) ; garder
+    // celui d'une image précédente faisait écrire le mod dans un écran détruit (plantage).
+    g_hudMovie = HudMovie(hud);
     UpdateGraphics();
+    UpdateDriving();
     static std::atomic<int> once{0};
     if (once.exchange(1) == 0) LOG("armes : mise a jour du HUD active (fil %lu)", GetCurrentThreadId());
     if (uint8_t* pl = Player()) {
@@ -3509,6 +4306,7 @@ __declspec(noinline) void __fastcall HookHudUpdate(void* hud)
     RestoreAutoEquip();
     KeepHiddenWeapons();
     KeepCustomModels();
+    UpdatePhysics();
     WatchThrownWeapon();
     UpdatePickupFree();
     RunDroppedCleanup();
@@ -3524,7 +4322,13 @@ __declspec(noinline) void __fastcall HookHudUpdate(void* hud)
         savedLong[2] = g_belt;
         SaveLoadout();
     }
-    static bool f9 = false, f10 = false;
+    static bool f9 = false, f10 = false, f11 = false, f12 = false;
+    const bool f12d = (GetAsyncKeyState(VK_F12) & 0x8000) != 0;
+    if (f12d && !f12) { g_iconTraceUntil = GetTickCount64() + 1000; LOG("icones : releve d'une seconde"); }
+    f12 = f12d;
+    const bool f11d = (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
+    if (f11d && !f11) { if (*drv::CurrentModel()) RecordGarage(); else LOG("garages : F11 se fait en voiture, devant le concessionnaire"); }
+    f11 = f11d;
     const bool f9d = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
     const bool f10d = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
     if (f10d && !f10) RecordSafehouse();
@@ -3663,6 +4467,245 @@ void ApplyWatchIfRequested()
     CloseHandle(th);
 }
 
+// ---- Physique des personnages (ragdolls, façon Euphoria) -------------------------------------
+// Le jeu a des ragdolls Havok « alimentés » (POWERED_TRACKING : le corps suit l'animation avec des
+// moteurs aux articulations). Le mod s'en sert pour les impacts de balles :
+//  - balle du joueur sur un personnage vivant : son ragdoll est pris en mode alimenté quelques
+//    dixièmes de seconde et reçoit l'impulsion de la balle (il encaisse, se plie, titube), puis
+//    rendu à l'animation ([Physics] HitReact, HitImpulse, HitTime) ;
+//  - impulsions des ragdolls du jeu (mort, chutes) multipliées ([Physics] DeathImpulse).
+// Fonctions du jeu (RVA vérifiées) : HitReactionComponent::ApplyBulletImpactImpulse 0x521B00,
+// RagdollComponent::Acquire 0x4547C0 / Release 0x472BE0 / ApplyImpulse 0x4588A0, Ragdoll::ApplyImpulse
+// 0xA10F0. RagdollComponent : +0x70 Ragdoll*, +0x80 poids du ragdoll, +0x84 vitesse reprise du proxy,
+// +0x88 état, +0x8C état voulu (0 suivi de vitesse, 1 alimenté), +0xE8 compteur de prises.
+constexpr uintptr_t kBulletImpactRva = 0x521B00;
+const uint8_t kBulletImpactPro[19] = { 0x48,0x8B,0xC4,0x55,0x41,0x54,0x41,0x55,0x41,0x56,0x41,0x57,0x48,0x8D,0xA8,0x28,0xFF,0xFF,0xFF };
+constexpr uintptr_t kRagCompImpulseRva = 0x4588A0;
+const uint8_t kRagCompImpulsePro[16] = { 0x48,0x83,0xEC,0x48,0xF3,0x41,0x0F,0x10,0x40,0x08,0xF3,0x41,0x0F,0x10,0x50,0x04 };
+constexpr uintptr_t kRagAcquireRva = 0x4547C0;
+constexpr uintptr_t kRagReleaseRva = 0x472BE0;
+constexpr uintptr_t kRagdollImpulseRva = 0xA10F0;
+// RagdollComponent::Update (appelée par le jeu pour chaque ragdoll actif) : les poussées du mod y sont
+// appliquées, au moment où le jeu touche lui-même aux ragdolls (hors du calcul de la physique ; les
+// appliquer depuis la boucle du HUD faisait fermer le jeu).
+constexpr uintptr_t kRagUpdateRva = 0x47C050;
+const uint8_t kRagUpdatePro[19] = { 0x40,0x55,0x56,0x41,0x54,0x41,0x55,0x48,0x8D,0x6C,0x24,0xF8,0x48,0x81,0xEC,0x08,0x01,0x00,0x00 };
+using RagUpdateFn = void(__fastcall*)(void* comp, float dt);
+RagUpdateFn g_origRagUpdate = nullptr;
+struct PendingPush { uint8_t* rc; float point[3], imp[3]; ULONGLONG t; };
+std::vector<PendingPush> g_pendingPush;   // sous g_hitLock
+
+using BulletImpactFn = void(__fastcall*)(void* comp, float* point, float* vel, uint8_t* proj, void* attacker, uint64_t a6);
+using RagCompImpulseFn = void(__fastcall*)(void* comp, int bone, const float* loc, const float* imp);
+BulletImpactFn g_origBulletImpact = nullptr;
+RagCompImpulseFn g_origRagCompImpulse = nullptr;
+
+struct PhysCfg { bool hitReact = true; float hitImpulse = 1.f, hitTime = 0.6f, hitWeight = 1.f, deathImpulse = 1.5f; } g_phys;
+
+struct HitReact {
+    uint8_t* obj;
+    float point[3], imp[3];
+    int stage;              // 0 à prendre, 1 en attente du ragdoll, 2 alimenté (rendu à la fin)
+    bool ours;              // ragdoll pris par le mod (à rendre)
+    ULONGLONG t;
+};
+std::vector<HitReact> g_hitReacts;
+SRWLOCK g_hitLock = SRWLOCK_INIT;
+std::vector<HitReact> g_hitQueue;   // impacts reçus (fil du jeu ou de la physique)
+
+// Poussée à appliquer au prochain passage du jeu dans la mise à jour de ce ragdoll.
+void QueuePush(uint8_t* rc, const float* point, const float* imp)
+{
+    AcquireSRWLockExclusive(&g_hitLock);
+    bool merged = false;
+    for (auto& q : g_pendingPush)
+        if (q.rc == rc) { for (int i = 0; i < 3; ++i) q.imp[i] += imp[i]; memcpy(q.point, point, sizeof(q.point)); merged = true; }
+    if (!merged && g_pendingPush.size() < 16)
+        g_pendingPush.push_back({ rc, { point[0], point[1], point[2] }, { imp[0], imp[1], imp[2] }, GetTickCount64() });
+    ReleaseSRWLockExclusive(&g_hitLock);
+}
+
+uint8_t* RagdollCompOf(uint8_t* obj)
+{
+    if (!obj || !nw::IsReadable(obj, 0x70) || !((*reinterpret_cast<uint16_t*>(obj + 0x4C) >> 14) & 1)) return nullptr;
+    uint8_t* comps = *reinterpret_cast<uint8_t**>(obj + 0x68);
+    if (!nw::IsReadable(comps, 0x2A8)) return nullptr;
+    uint8_t* rc = *reinterpret_cast<uint8_t**>(comps + 0x2A0);
+    return nw::IsReadable(rc, 0xF0) ? rc : nullptr;
+}
+
+// Impulsion répartie sur toutes les pièces du ragdoll, appliquée au point d'impact (le corps est
+// poussé et tourne autour du point touché).
+int PushRagdoll(uint8_t* rc, const float* point, const float* imp)
+{
+    uint8_t* rag = *reinterpret_cast<uint8_t**>(rc + 0x70);
+    if (!nw::IsReadable(rag, 0x110)) return 0;
+    uint8_t* data = *reinterpret_cast<uint8_t**>(rag + 0x108);
+    if (!nw::IsReadable(data, 0x30)) return 0;
+    uint8_t* map = *reinterpret_cast<uint8_t**>(data + 0x28);
+    if (!nw::IsReadable(map, 0x60)) return 0;
+    const int n = *reinterpret_cast<int*>(map + 0x58);
+    uint8_t* entries = *reinterpret_cast<uint8_t**>(map + 0x50);
+    if (n <= 0 || n > 64 || !nw::IsReadable(entries, static_cast<size_t>(n) * 0x40)) return 0;
+    alignas(16) float loc[4] = { point[0], point[1], point[2], 0.f };
+    alignas(16) float each[4] = { imp[0] / n, imp[1] / n, imp[2] / n, 0.f };
+    auto fn = reinterpret_cast<void(__fastcall*)(void*, int, const float*, const float*)>(g_base + kRagdollImpulseRva);
+    for (int i = 0; i < n; ++i) fn(rag, *reinterpret_cast<int16_t*>(entries + i * 0x40), loc, each);
+    return n;
+}
+
+void __fastcall HookRagUpdate(void* comp, float dt)
+{
+    g_origRagUpdate(comp, dt);
+    uint8_t* rc = static_cast<uint8_t*>(comp);
+    PendingPush job{};
+    bool have = false;
+    AcquireSRWLockExclusive(&g_hitLock);
+    for (size_t i = 0; i < g_pendingPush.size(); ++i) {
+        if (g_pendingPush[i].rc != rc) continue;
+        job = g_pendingPush[i];
+        g_pendingPush.erase(g_pendingPush.begin() + static_cast<std::ptrdiff_t>(i));
+        have = true;
+        break;
+    }
+    ReleaseSRWLockExclusive(&g_hitLock);
+    if (have && *reinterpret_cast<void**>(rc + 0x70) && *reinterpret_cast<int*>(rc + 0x88) < 2) PushRagdoll(rc, job.point, job.imp);
+}
+
+void __fastcall HookRagCompImpulse(void* comp, int bone, const float* loc, const float* imp)
+{
+    alignas(16) float scaled[4] = { imp[0] * g_phys.deathImpulse, imp[1] * g_phys.deathImpulse, imp[2] * g_phys.deathImpulse, 0.f };
+    g_origRagCompImpulse(comp, bone, loc, scaled);
+}
+
+void __fastcall HookBulletImpact(void* comp, float* point, float* vel, uint8_t* proj, void* attacker, uint64_t a6)
+{
+    g_origBulletImpact(comp, point, vel, proj, attacker, a6);
+    if (!g_phys.hitReact || !comp || !point || !vel || attacker != Player()) return;
+    uint8_t* obj = *reinterpret_cast<uint8_t**>(static_cast<uint8_t*>(comp) + 0x28);
+    if (!obj || obj == Player()) return;
+    // Personnages seulement (bit 14 de +0x4C) : une balle sur un véhicule passe aussi par ici, et
+    // prendre un ragdoll sur un véhicule faisait planter le jeu (taxi touché).
+    if (!nw::IsReadable(obj, 0x50) || !((*reinterpret_cast<uint16_t*>(obj + 0x4C) >> 14) & 1)) return;
+    // Impulsion de l'arme (fiche du mode de tir, +0x5C) dans la direction de la balle.
+    float power = 10.f;
+    if (uint8_t* wp = proj ? *reinterpret_cast<uint8_t**>(proj + 0x10) : nullptr; nw::IsReadable(wp, 0xB8)) {
+        uint8_t* modes = *reinterpret_cast<uint8_t**>(wp + 0xB0);
+        const uint32_t mode = *reinterpret_cast<uint32_t*>(wp + 0xAC);
+        if (mode < 4 && nw::IsReadable(modes, 8 + (mode + 1) * 8)) {
+            uint8_t* fm = *reinterpret_cast<uint8_t**>(modes + 8 + mode * 8);
+            if (nw::IsReadable(fm, 0x60)) power = *reinterpret_cast<float*>(fm + 0x5C);
+        }
+    }
+    const float len = sqrtf(vel[0] * vel[0] + vel[1] * vel[1] + vel[2] * vel[2]);
+    if (len < 1e-3f) return;
+    const float k = power * g_phys.hitImpulse / len;
+    HitReact r{ obj, { point[0], point[1], point[2] }, { vel[0] * k, vel[1] * k, vel[2] * k }, 0, false, GetTickCount64() };
+    AcquireSRWLockExclusive(&g_hitLock);
+    if (g_hitQueue.size() < 16) g_hitQueue.push_back(r);
+    ReleaseSRWLockExclusive(&g_hitLock);
+}
+
+void UpdatePhysics()
+{
+    static bool init = false;
+    if (!init) {
+        init = true;
+        char buf[32];
+        g_phys.hitReact = GetPrivateProfileIntA("Physics", "HitReact", 1, g_iniPath) != 0;
+        GetPrivateProfileStringA("Physics", "HitImpulse", "1.0", buf, sizeof(buf), g_iniPath);
+        g_phys.hitImpulse = static_cast<float>(atof(buf));
+        GetPrivateProfileStringA("Physics", "HitTime", "0.6", buf, sizeof(buf), g_iniPath);
+        g_phys.hitTime = static_cast<float>(atof(buf));
+        GetPrivateProfileStringA("Physics", "HitWeight", "1.0", buf, sizeof(buf), g_iniPath);
+        g_phys.hitWeight = static_cast<float>(atof(buf));
+        GetPrivateProfileStringA("Physics", "DeathImpulse", "1.5", buf, sizeof(buf), g_iniPath);
+        g_phys.deathImpulse = static_cast<float>(atof(buf));
+        LOG("physique : reactions aux balles %d (impulsion x%.2f, %.2f s, poids %.2f), impulsions des ragdolls x%.2f",
+            g_phys.hitReact ? 1 : 0, g_phys.hitImpulse, g_phys.hitTime, g_phys.hitWeight, g_phys.deathImpulse);
+    }
+    AcquireSRWLockExclusive(&g_hitLock);
+    std::vector<HitReact> fresh;
+    fresh.swap(g_hitQueue);
+    ReleaseSRWLockExclusive(&g_hitLock);
+    const ULONGLONG now = GetTickCount64();
+    AcquireSRWLockExclusive(&g_hitLock);
+    for (size_t i = 0; i < g_pendingPush.size();)
+        if (now - g_pendingPush[i].t > 500) g_pendingPush.erase(g_pendingPush.begin() + static_cast<std::ptrdiff_t>(i)); else ++i;
+    ReleaseSRWLockExclusive(&g_hitLock);
+    static int logs = 0;
+    for (auto& r : fresh) {
+        // Déjà en réaction : l'impulsion s'ajoute (rafale).
+        bool merged = false;
+        for (auto& e : g_hitReacts) {
+            if (e.obj != r.obj) continue;
+            merged = true;
+            if (e.stage == 2) { if (uint8_t* rc = RagdollCompOf(e.obj)) QueuePush(rc, r.point, r.imp); e.t = now; }
+            else { for (int i = 0; i < 3; ++i) e.imp[i] += r.imp[i]; memcpy(e.point, r.point, sizeof(e.point)); }
+        }
+        if (!merged && g_hitReacts.size() < 8) g_hitReacts.push_back(r);
+    }
+    auto acquire = reinterpret_cast<uint8_t* (__fastcall*)(void*)>(g_base + kRagAcquireRva);
+    auto release = reinterpret_cast<void(__fastcall*)(void*, char)>(g_base + kRagReleaseRva);
+    for (size_t i = 0; i < g_hitReacts.size();) {
+        HitReact& r = g_hitReacts[i];
+        bool done = false;
+        if (r.stage == 0) {
+            uint8_t* rc = RagdollCompOf(r.obj);
+            if (rc && *reinterpret_cast<int*>(rc + 0xE8) > 0) {
+                // Ragdoll déjà utilisé par le jeu (mort, chute) : simple poussée en plus.
+                const int st = *reinterpret_cast<int*>(rc + 0x88);
+                if (st < 2) QueuePush(rc, r.point, r.imp);
+                if (logs < 30) { ++logs; LOG("physique : %s deja en ragdoll (etat %d)%s", ObjName(r.obj), st, st < 2 ? ", poussee" : ""); }
+                done = true;
+            } else if ((rc = acquire(r.obj)) != nullptr) {
+                r.ours = true;
+                *reinterpret_cast<int*>(rc + 0x8C) = 1;                   // alimenté
+                *reinterpret_cast<float*>(rc + 0x80) = g_phys.hitWeight;
+                r.stage = 1;
+                r.t = now;
+            } else {
+                done = true;
+            }
+        } else if (r.stage == 1) {
+            uint8_t* rc = RagdollCompOf(r.obj);
+            if (!rc) { done = true; }
+            else if (*reinterpret_cast<void**>(rc + 0x70) && *reinterpret_cast<int*>(rc + 0x88) == 1) {
+                const float imp = sqrtf(r.imp[0] * r.imp[0] + r.imp[1] * r.imp[1] + r.imp[2] * r.imp[2]);
+                QueuePush(rc, r.point, r.imp);
+                if (logs < 30) { ++logs; LOG("physique : %s touche, ragdoll alimente apres %llu ms, impulsion %.1f", ObjName(r.obj), now - r.t, imp); }
+                r.stage = 2;
+                r.t = now;
+            } else if (now - r.t > 400) {
+                if (logs < 30) { ++logs; LOG("physique : %s, ragdoll pas pret (etat %d), abandon", ObjName(r.obj), *reinterpret_cast<int*>(rc + 0x88)); }
+                done = true;
+            }
+        } else if (now - r.t > static_cast<ULONGLONG>(g_phys.hitTime * 1000.f)) {
+            done = true;
+        }
+        if (done) {
+            if (r.ours && RagdollCompOf(r.obj)) release(r.obj, 0);
+            g_hitReacts.erase(g_hitReacts.begin() + static_cast<std::ptrdiff_t>(i));
+        } else {
+            ++i;
+        }
+    }
+}
+
+// VehicleLookComponent::OnUpdateMaterial (comp, composant d'affichage) : le jeu y reconstruit les
+// surcharges de matériau ; la peinture du mod y est reposée juste après.
+constexpr uintptr_t kVehicleLookRva = 0x5880B0;
+const uint8_t kVehicleLookPro[15] = { 0x48,0x89,0x5C,0x24,0x18,0x55,0x56,0x57,0x48,0x81,0xEC,0x30,0x01,0x00,0x00 };
+using VehicleLookFn = void(__fastcall*)(void* comp, void* drawable);
+VehicleLookFn g_origVehicleLook = nullptr;
+
+__declspec(noinline) void __fastcall HookVehicleLook(void* comp, void* drawable)
+{
+    if (!g_origVehicleLook) return;
+    g_origVehicleLook(comp, drawable);
+    drv::OnVehicleLook(drawable);
+}
+
 void InstallWeapons()
 {
     HookGameDebugPrint();
@@ -3674,10 +4717,81 @@ void InstallWeapons()
     ok += Detour("ranger", kStowRva, kStowPro, sizeof(kStowPro), reinterpret_cast<void*>(&HookStow), g_origStow);
     ok += Detour("hud", kHudUpdateRva, kHudUpdatePro, sizeof(kHudUpdatePro), reinterpret_cast<void*>(&HookHudUpdate), g_origHudUpdate);
     LOG("armes : %d/4 detours installes (RB maintenu / Tab roue, F5 ceinture, F6/F8 armes longues, F7 mains nues, F9 kit, F10 planque)", ok);
+    if (GetPrivateProfileIntA("Physics", "Enabled", 1, g_iniPath)) {
+        int pk = 0;
+        pk += Detour("impact de balle", kBulletImpactRva, kBulletImpactPro, sizeof(kBulletImpactPro), reinterpret_cast<void*>(&HookBulletImpact), g_origBulletImpact);
+        pk += Detour("impulsion de ragdoll", kRagCompImpulseRva, kRagCompImpulsePro, sizeof(kRagCompImpulsePro), reinterpret_cast<void*>(&HookRagCompImpulse), g_origRagCompImpulse);
+        pk += Detour("mise a jour de ragdoll", kRagUpdateRva, kRagUpdatePro, sizeof(kRagUpdatePro), reinterpret_cast<void*>(&HookRagUpdate), g_origRagUpdate);
+        LOG("physique : %d/3 detours installes", pk);
+    }
+    if (Detour("icones de la grande carte", kWorldMapBlipsRva, kWorldMapBlipsPro, sizeof(kWorldMapBlipsPro), reinterpret_cast<void*>(&HookWorldMapBlips), g_origWorldMapBlips))
+        LOG("garages : icones ajoutees a la grande carte");
+    if (Detour("peinture des vehicules", kVehicleLookRva, kVehicleLookPro, sizeof(kVehicleLookPro), reinterpret_cast<void*>(&HookVehicleLook), g_origVehicleLook))
+        LOG("garages : peinture gardee a la reconstruction des vehicules");
     LoadArmory();
+    LoadGarages();
 }
 
 }  // namespace
+
+// Plantages : le jeu se fermait parfois sans rapport Windows. Une exception grave (accès mémoire
+// invalide, instruction illégale, pile pleine) est notée dans le journal avec le module et l'adresse,
+// puis laissée au jeu. Au plus 8 notes.
+EXTERN_C IMAGE_DOS_HEADER __ImageBase;
+LONG CALLBACK CrashLogger(EXCEPTION_POINTERS* ep)
+{
+    const DWORD code = ep->ExceptionRecord->ExceptionCode;
+    if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION && code != EXCEPTION_STACK_OVERFLOW
+        && code != EXCEPTION_INT_DIVIDE_BY_ZERO && code != 0xC0000374) return EXCEPTION_CONTINUE_SEARCH;
+    // Une note par adresse : les lectures protégées du mod (recherche de la caméra) en font beaucoup,
+    // rattrapées sans dommage.
+    static std::atomic<uintptr_t> seen[16] = {};
+    static std::atomic<int> notes{0};
+    const uintptr_t addr = reinterpret_cast<uintptr_t>(ep->ExceptionRecord->ExceptionAddress);
+    for (auto& v : seen) if (v.load() == addr) return EXCEPTION_CONTINUE_SEARCH;
+    const int idx = notes.fetch_add(1);
+    if (idx >= 16) return EXCEPTION_CONTINUE_SEARCH;
+    seen[idx] = addr;
+    auto where = [](uintptr_t a, char* out, size_t n) {
+        HMODULE m = nullptr;
+        char name[MAX_PATH] = "?";
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCSTR>(a), &m) && m) {
+            GetModuleFileNameA(m, name, MAX_PATH);
+            const char* b = strrchr(name, '\\');
+            snprintf(out, n, "%s+0x%llX", b ? b + 1 : name, static_cast<unsigned long long>(a - reinterpret_cast<uintptr_t>(m)));
+        } else {
+            snprintf(out, n, "%p", reinterpret_cast<void*>(a));
+        }
+    };
+    char at[160], ret[160];
+    where(reinterpret_cast<uintptr_t>(ep->ExceptionRecord->ExceptionAddress), at, sizeof(at));
+    const CONTEXT* c = ep->ContextRecord;
+    uintptr_t r = 0;
+    if (c && nw::IsReadable(reinterpret_cast<void*>(c->Rsp), 8)) r = *reinterpret_cast<uintptr_t*>(c->Rsp);
+    where(r, ret, sizeof(ret));
+    LOG("PLANTAGE ? exception %08lX a %s (fil %lu), acces %llX, retour possible %s", code, at, GetCurrentThreadId(),
+        ep->ExceptionRecord->NumberParameters > 1 ? static_cast<unsigned long long>(ep->ExceptionRecord->ExceptionInformation[1]) : 0ull, ret);
+    // Pile : adresses de retour possibles dans le mod (dinput8) ou le jeu, pour savoir qui appelait.
+    if (c && nw::IsReadable(reinterpret_cast<void*>(c->Rsp), 0x400)) {
+        char line[512] = "";
+        int found = 0;
+        const HMODULE self = reinterpret_cast<HMODULE>(&__ImageBase);
+        for (int i = 0; i < 0x80 && found < 8; ++i) {
+            const uintptr_t v = reinterpret_cast<uintptr_t*>(c->Rsp)[i];
+            HMODULE m = nullptr;
+            if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                    reinterpret_cast<LPCSTR>(v), &m) || !m) continue;
+            if (m != self && m != GetModuleHandleW(nullptr)) continue;
+            char one[48];
+            snprintf(one, sizeof(one), " %s+0x%llX", m == self ? "mod" : "jeu", static_cast<unsigned long long>(v - reinterpret_cast<uintptr_t>(m)));
+            strcat_s(line, one);
+            ++found;
+        }
+        LOG("PLANTAGE ? pile :%s", line);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
 
 extern "C" __declspec(dllexport) HRESULT WINAPI DirectInput8Create(HINSTANCE inst, DWORD ver, REFIID riid, LPVOID* out, void* outer)
 {
@@ -3697,6 +4811,7 @@ BOOL WINAPI DllMain(HMODULE module, DWORD reason, LPVOID)
         DisableThreadLibraryCalls(module);
         g_base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
         g_log = _fsopen("SleepingDogsRemaster.log", "w", _SH_DENYNO);
+        AddVectoredExceptionHandler(0, &CrashLogger);
         GetFullPathNameA("SleepingDogsRemaster.ini", MAX_PATH, g_iniPath, nullptr);
         LOG("Sleeping Dogs Remaster charge");
         nw::SetLog([](const char* s) { LOG("%s", s); });

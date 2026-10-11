@@ -23,6 +23,12 @@ bool ApplyModel(void* simObject, uint32_t uid);
 // Vrai si l'objet porte le modèle uid (une arme du mod, même lâchée puis ramassée).
 bool HasModel(void* simObject, uint32_t uid);
 
+// Vrai si la zone mémoire du jeu est lisible (zones vérifiées gardées en cache).
+bool IsReadable(const void* p, size_t n);
+
+// Uid de la texture d'une icône du mod créée par IconState (0 si absente).
+uint32_t IconUid(const char* name);
+
 // Chargeur de l'arme ramené à maxAmmo au plus (composant GunComponent). Rend les munitions qu'il
 // contenait avant, -1 si l'objet n'a pas de composant d'arme à feu.
 int ClampClipAmmo(void* simObject, int maxAmmo);

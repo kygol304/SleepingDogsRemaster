@@ -18,6 +18,13 @@ weapons with their own 3D models.
   The game's pick-up prompt shows the mod weapons' names and icons
 - Focus bar (blue, under the yellow combat meter): **D-pad right** / **X** slows time down; it fills up like the combat meter (`[Focus]` in the ini)
 - Night-time look: brighter, more saturated neon glow (`[Graphics]` in the ini)
+- Physics: characters hit by your bullets stagger and react with their ragdoll (Euphoria-like); stronger death impulses (`[Physics]`)
+- More realistic driving: grip, body roll, suspension, brakes, less artificial stability help (`[Driving]`)
+- **Tuning shops** (Los Santos Customs-like), shown on the minimap and the pause map: engine (real top speed x1.2 / x1.45 / x1.75
+  of each vehicle), brakes, grip, nitro (3 levels: 2 / 4 / 6 s) and paint (20 colors), with a live preview, before / after stat bars
+  and a menu in the style of the game's shops. The tuning belongs to the vehicle you modified (cars and bikes)
+- **Nitro**: **A** / **N** while driving, flames out of the exhaust and a speed effect; speedometer next to the minimap
+- Minimap icons stay anchored to the streets
 - French / English texts, following the game language
 
 ## Controls
@@ -33,6 +40,10 @@ weapons with their own 3D models.
 | Armory (in a safehouse) | **A** in the wheel | left click in the wheel |
 | Direct weapon access | - | **1** bare hands, **2** belt, **3** / **4** long guns |
 | Change the bare-hands icon | **Y** in the wheel | - |
+| Nitro (equipped vehicle) | **A** | **N** |
+| Tuning shop (stopped in a shop) | **D-pad left** | **C** |
+| Tuning menu: browse / confirm / back | stick or D-pad up-down / **A** / **B** | up-down arrows / Enter / Escape |
+| Add a tuning shop at your position | - | **F11** (in a vehicle) |
 
 ## Settings (`SleepingDogsRemaster.ini`)
 
@@ -79,6 +90,7 @@ Scales are multipliers of the original game value: `1.0` = original, `1.2` = 20 
 | `Rounded` | `1` | `1` = GTA-style rounded rectangle, `0` = original round map |
 | `OffsetX` / `OffsetY` | `-40` / `40` | Map position offset in pixels (negative = left / up) |
 | `MinZoom` | `1.05` | Minimum zoom (higher = closer; avoids empty corners when driving fast) |
+| `CarZoomBonus` | `0.25` | Extra minimum zoom in a vehicle |
 
 ### `[Wheel]` - weapon wheel
 
@@ -134,6 +146,54 @@ The focus can be started from 10 % of the bar.
 | `Exposure` | `0.0` | Global brightness in EV (`0` = original, `0.3` = brighter, `-0.3` = darker) |
 
 The night values are used between 8 pm and 5 am in game, with a smooth transition at dusk and dawn.
+
+### `[Physics]` - hit reactions
+
+| Key | Default | Effect |
+|---|---|---|
+| `Enabled` | `1` | `1` = mod physics, `0` = original |
+| `HitReact` | `1` | Characters hit by the player's bullets react with their ragdoll |
+| `HitImpulse` | `1.0` | Strength of the bullet push |
+| `HitTime` | `0.6` | Seconds before the character gets back to its animation |
+| `HitWeight` | `1.0` | Ragdoll weight during the reaction |
+| `DeathImpulse` | `1.5` | Multiplier of the game's death / fall impulses |
+
+### `[Driving]` - realistic driving
+
+Multipliers of the original vehicle values. Bikes only get the tuning (the realism settings would make them fall).
+
+| Key | Default | Effect |
+|---|---|---|
+| `Enabled` | `1` | `1` = mod driving, `0` = original |
+| `Grip` / `RearGrip` | `0.92` / `0.95` | Tyre grip, extra rear grip factor (the rear slides a bit before the front) |
+| `BodyRoll` | `2.5` | Body roll / pitch from the tyre forces |
+| `AntiRoll` | `0.5` | The game's anti-rollover help |
+| `Suspension` / `Damping` | `0.85` / `0.9` | Springs, shock absorbers |
+| `SpinDamping` | `0.6` | Artificial rotation braking (lower = slides possible) |
+| `Equalizer` | `0.5` | Grip equalization between wheels |
+| `ExtraTorque` | `0.5` | Turning torque added by the game |
+| `Brakes` | `0.85` | Brake force |
+| `TopSpeed` | `1.35` | The game's speed limiter (x original) |
+
+### `[Garages]` and `[Tuning]` - tuning shops
+
+| Key | Default | Effect |
+|---|---|---|
+| `[Garages] Radius` | `15` | Shop radius in meters |
+| `[Garages] IconSize` | `20` | Icon size on the minimap |
+| `[Garages] Count`, `G1`, `G2`... | 4 shops | Shop positions; **F11** in a vehicle adds one |
+| `[Tuning]` | - | Written by the shop: one line per modified vehicle (engine, brakes, grip, nitro level, paint) |
+
+### `[Nitro]`
+
+| Key | Default | Effect |
+|---|---|---|
+| `Key` | `N` | Keyboard key (controller: **A**) |
+| `Power` | `2.5` | Torque multiplier during the boost |
+| `Duration` | `6` | Seconds of boost for a full tank when the vehicle has no nitro level |
+| `Recharge` | `25` | Seconds to refill the tank |
+| `Fov` | `1.3` | Field of view during the boost (speed effect) |
+| `FlameEffect` | `20` | Vehicle effect used for the exhaust flames |
 
 ### `[Armory]` and `[Safehouses]`
 

@@ -723,4 +723,13 @@ bool HasModel(void* simObject, uint32_t uid)
     return has;
 }
 
+
+bool IsReadable(const void* p, size_t n) { return Readable(p, n); }
+
+uint32_t IconUid(const char* name)
+{
+    auto it = g_icons.find(name);
+    return it != g_icons.end() && it->second.tex && !it->second.failed ? it->second.tex->mNode.mUID : 0;
+}
+
 }  // namespace nw
