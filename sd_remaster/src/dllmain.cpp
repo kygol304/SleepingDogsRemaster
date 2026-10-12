@@ -87,6 +87,12 @@ struct Settings {
     float vehFovScale = 1.15f;    // champ de vision en voiture
     float vehDistanceScale = 0.95f;
     float vehHeight = -0.15f;     // caméra de conduite plus basse (m)
+    // Champ de vision par situation ([CameraFov], réglable dans le menu pause > Options > Caméra).
+    float armedFov = 1.2f;        // arme en main (marche / sprint arme) ; par défaut comme à pied
+    float aimFov = 1.0f;          // visée (épaule, téléphone, sniper)
+    float bikeFov = 1.15f;        // moto, scooter ; par défaut comme en voiture
+    float boatFov = 1.15f;        // bateaux ; par défaut comme en voiture
+    float vehAimFov = 1.0f;       // visée depuis un véhicule
 };
 Settings g_cfg;
 std::atomic<bool> g_roundMinimap{true};
@@ -141,6 +147,14 @@ void WriteDefaultIni()
           "DistanceScale=1.08\n"
           "; Hauteur en metres (negatif = plus bas)\n"
           "Height=-0.15\n"
+          "\n[CameraFov]\n"
+          "; champ de vision par situation (aussi dans le menu pause > Options > Camera) : arme en main, visee,\n"
+          "; moto, bateau, visee depuis un vehicule (a pied : [Camera] FovScale, combat : [Combat], voiture : [Vehicle])\n"
+          "Armed=1.2\n"
+          "Aim=1.0\n"
+          "Bike=1.15\n"
+          "Boat=1.15\n"
+          "VehicleAim=1.0\n"
           "\n[Minimap]\n"
           "; 1 = rectangle aux coins arrondis facon GTA, 0 = rond d'origine\n"
           "Rounded=1\n"
@@ -252,6 +266,11 @@ bool ReloadIniIfChanged()
     s.vehFovScale = IniFloat("FovScale", s.vehFovScale, "Vehicle");
     s.vehDistanceScale = IniFloat("DistanceScale", s.vehDistanceScale, "Vehicle");
     s.vehHeight = IniFloat("Height", s.vehHeight, "Vehicle");
+    s.armedFov = IniFloat("Armed", s.fovScale, "CameraFov");
+    s.aimFov = IniFloat("Aim", s.aimFov, "CameraFov");
+    s.bikeFov = IniFloat("Bike", s.vehFovScale, "CameraFov");
+    s.boatFov = IniFloat("Boat", s.vehFovScale, "CameraFov");
+    s.vehAimFov = IniFloat("VehicleAim", s.vehAimFov, "CameraFov");
     g_cfg = s;
     ReadMinimapSetting();
     LOG("reglages : actif=%d fov x%.2f distance x%.2f hauteur %+.2f epaule %+.2f douceur x%.2f combat=%d | vehicule actif=%d fov x%.2f distance x%.2f hauteur %+.2f | minimap arrondie=%d",
@@ -347,10 +366,16 @@ void ApplyCamera(CameraState& cam)
         const uintptr_t dst = cam.obj + kFollow_Params + c * kFollowParamsSize;
         const uintptr_t src = reinterpret_cast<uintptr_t>(cam.original) + c * kFollowParamsSize;
         memcpy(reinterpret_cast<void*>(dst), reinterpret_cast<void*>(src), kFollowParamsSize);
-        const bool aiming = (c >= 4 && c <= 7) || c == 12;  // la visée garde son cadrage d'origine
+        const bool aiming = (c >= 4 && c <= 7) || c == 12;  // la visée garde son cadrage d'origine (sauf le champ de vision)
         const bool combat = (c == 8 || c == 13 || c == 14);  // marche ciblée, focus, prise
-        if (!g_cfg.enabled || aiming || (combat && !g_cfg.combatToo)) continue;
-        const float fovScale  = combat ? g_cfg.combatFovScale : g_cfg.fovScale;
+        const bool armed = c == 9 || c == 10;                // marche / sprint arme en main
+        if (!g_cfg.enabled || (combat && !g_cfg.combatToo)) continue;
+        if (aiming) {
+            F(dst, kFP_Fov)    = F(src, kFP_Fov) * g_cfg.aimFov;
+            F(dst, kFP_FovMax) = F(src, kFP_FovMax) * g_cfg.aimFov;
+            continue;
+        }
+        const float fovScale  = combat ? g_cfg.combatFovScale : armed ? g_cfg.armedFov : g_cfg.fovScale;
         const float distScale = combat ? g_cfg.combatDistanceScale : g_cfg.distanceScale;
         const float height    = combat ? g_cfg.combatHeight : g_cfg.height;
         F(dst, kFP_Fov)       = F(src, kFP_Fov) * fovScale;
@@ -506,8 +531,15 @@ void ApplyChaseParams()
                 eye[i * 4 + 1] *= g_cfg.vehDistanceScale;
                 eye[i * 4 + 2] += g_cfg.vehHeight;          // hauteur
             }
-            fov[2] *= g_cfg.vehFovScale * g_fovBoost;  // fov à basse vitesse
-            fov[3] *= g_cfg.vehFovScale * g_fovBoost;  // fov à haute vitesse
+            // Champ de vision selon le véhicule (nom des réglages : « Bike Drive », « Speed Boat Race »,
+            // « Car Aim »...) : visée, moto / scooter, bateau, sinon voiture.
+            const size_t len = strlen(cp.name);
+            float mul = g_cfg.vehFovScale;
+            if (len > 4 && strcmp(cp.name + len - 4, " Aim") == 0) mul = g_cfg.vehAimFov;
+            else if (strncmp(cp.name, "Bike", 4) == 0 || strncmp(cp.name, "Scooter", 7) == 0) mul = g_cfg.bikeFov;
+            else if (strstr(cp.name, "Boat")) mul = g_cfg.boatFov;
+            fov[2] *= mul * g_fovBoost;  // fov à basse vitesse
+            fov[3] *= mul * g_fovBoost;  // fov à haute vitesse
         }
         if (g_orbitOn) {
             // Atelier : l'œil tourne autour de la voiture (plan horizontal), un peu plus loin et plus haut.
@@ -2213,6 +2245,8 @@ XInputGetStateFn g_gameXInput = nullptr;      // import du jeu
 std::atomic<bool> g_wheelOpen{false};
 extern std::atomic<bool> g_armOpen;
 bool ArmHoverActive();
+bool CamHoverActive();
+extern std::atomic<bool> g_camOpen;
 void UpdateWardrobeArmory();
 std::atomic<ULONGLONG> g_pulseEnd{0};
 extern std::atomic<ULONGLONG> g_drawPulseFrom, g_drawPulseUntil;
@@ -2239,7 +2273,7 @@ DWORD WINAPI GameXInputGetState(DWORD user, PadState* st)
     if (r == 0 && st && user < 4) {
         if (st->buttons || abs(st->lx) > 9000 || abs(st->ly) > 9000 || abs(st->rx) > 9000 || abs(st->ry) > 9000
             || st->lt > 60 || st->rt > 60) g_lastInputKbm = false;
-        if (ArmHoverActive()) st->buttons &= ~0x1000;   // A sur « ARMES » : pour le mod
+        if (ArmHoverActive() || CamHoverActive()) st->buttons &= ~0x1000;   // A sur « ARMES » / « CAMÉRA » : pour le mod
         const ULONGLONG now = GetTickCount64();
         // Seulement en jeu (HUD mis à jour il y a moins de 150 ms) : sur la carte ou dans les menus du
         // jeu, ces touches restent au jeu (A pose le point sur la carte).
@@ -2266,7 +2300,7 @@ DWORD WINAPI GameXInputGetState(DWORD user, PadState* st)
         // Menu ouvert : rien pour le jeu ; après fermeture, A / B restent bloqués jusqu'au relâchement
         // (sinon le B qui ferme le menu ferait aussi quitter la garde-robe).
         static bool holdAfterMenu = false;
-        if (g_armOpen.load() || g_garOpen.load()) { st->buttons = 0; st->lx = st->ly = st->rx = st->ry = 0; st->lt = st->rt = 0; holdAfterMenu = true; }
+        if (g_armOpen.load() || g_garOpen.load() || g_camOpen.load()) { st->buttons = 0; st->lx = st->ly = st->rx = st->ry = 0; st->lt = st->rt = 0; holdAfterMenu = true; }
         else if (holdAfterMenu) { if (st->buttons & 0x3000) st->buttons &= ~0x3000; else holdAfterMenu = false; }
     }
     return r;
@@ -3113,6 +3147,129 @@ bool UpdateArmory(const PadState& pad, bool padOk)
     return true;
 }
 
+// ---- Menu pause : Options > Caméra ------------------------------------------------------------
+// Le Flash du menu pause (PauseMenu.bin modifié, ui\pause_gta.as) ajoute CAMÉRA au sous-menu des
+// options et appelle « GTA_CAM_TICK » à chaque image (1 si CAMÉRA est surlignée). A / Entrée ouvre
+// alors ce réglage : champ de vision par situation, écrit dans le .ini (relu en direct par la caméra).
+struct CamItem { const char* fr; const char* en; const char* section; const char* key; float def; };
+const CamItem kCamItems[] = {
+    { "A pied", "On foot", "Camera", "FovScale", 1.2f },
+    { "Arme en main", "Weapon drawn", "CameraFov", "Armed", 1.2f },
+    { "Visee", "Aiming", "CameraFov", "Aim", 1.0f },
+    { "Combat", "Melee combat", "Combat", "FovScale", 1.10f },
+    { "Voiture", "Car", "Vehicle", "FovScale", 1.15f },
+    { "Moto", "Bike", "CameraFov", "Bike", 1.15f },
+    { "Bateau", "Boat", "CameraFov", "Boat", 1.15f },
+    { "Visee en vehicule", "Aiming in a vehicle", "CameraFov", "VehicleAim", 1.0f },
+};
+constexpr int kCamCount = static_cast<int>(sizeof(kCamItems) / sizeof(kCamItems[0]));
+std::atomic<bool> g_camOpen{false};
+std::atomic<bool> g_camHover{false};
+std::atomic<ULONGLONG> g_camHoverTick{0};
+bool CamHoverActive() { return g_camHover.load() && GetTickCount64() - g_camHoverTick.load() < 1500; }
+
+float CamCurrent(int i)
+{
+    switch (i) {
+    case 0: return g_cfg.fovScale;
+    case 1: return g_cfg.armedFov;
+    case 2: return g_cfg.aimFov;
+    case 3: return g_cfg.combatFovScale;
+    case 4: return g_cfg.vehFovScale;
+    case 5: return g_cfg.bikeFov;
+    case 6: return g_cfg.boatFov;
+    default: return g_cfg.vehAimFov;
+    }
+}
+
+void CamWrite(int i, float v)
+{
+    char buf[32];
+    sprintf_s(buf, "%.2f", v);
+    WritePrivateProfileStringA(kCamItems[i].section, kCamItems[i].key, buf, g_iniPath);
+}
+
+// Appelé à chaque image du menu pause (fil de l'interface).
+void UpdateCameraMenu(void* movie, bool hover)
+{
+    static float vals[kCamCount];
+    static int sel = 0;
+    static bool was[6] = { true, true, true, true, true, true };   // haut, bas, gauche, droite, A, B
+    static ULONGLONG repeatAt = 0;
+    const ULONGLONG now = GetTickCount64();
+    g_camHover = hover;
+    g_camHoverTick = now;
+    PadState pad{};
+    const bool padOk = ReadPad(pad);
+    DWORD pid = 0;
+    GetWindowThreadProcessId(GetForegroundWindow(), &pid);
+    const bool fg = pid == GetCurrentProcessId();
+    auto key = [&](int vk) { return fg && (GetAsyncKeyState(vk) & 0x8000) != 0; };
+    const WORD b = padOk ? pad.buttons : 0;
+    const bool held[6] = {
+        (b & 0x0001) || (padOk && pad.ly > 16000) || key(VK_UP),
+        (b & 0x0002) || (padOk && pad.ly < -16000) || key(VK_DOWN),
+        (b & 0x0004) || (padOk && pad.lx < -16000) || key(VK_LEFT),
+        (b & 0x0008) || (padOk && pad.lx > 16000) || key(VK_RIGHT),
+        (b & 0x1000) || key(VK_RETURN),
+        (b & 0x2000) || key(VK_ESCAPE) || key(VK_BACK),
+    };
+    bool press[6];
+    for (int i = 0; i < 6; ++i) {
+        const bool repeat = i < 4 && held[i] && was[i] && now >= repeatAt;
+        press[i] = held[i] && (!was[i] || repeat);
+        if (held[i] && i < 4 && (!was[i] || repeat)) repeatAt = now + (was[i] ? 90 : 350);
+        was[i] = held[i];
+    }
+    if (!g_camOpen.load()) {
+        if (hover && press[4]) {
+            g_camOpen = true;
+            sel = 0;
+            for (int i = 0; i < kCamCount; ++i) vals[i] = CamCurrent(i);
+            LOG("camera : reglage du champ de vision ouvert (menu pause)");
+        } else {
+            SetFlashNumber(movie, "_root.gtaCamOpen", 0);
+            return;
+        }
+    } else {
+        const int rows = kCamCount + 1;   // + valeurs par défaut
+        if (press[0]) sel = (sel + rows - 1) % rows;
+        if (press[1]) sel = (sel + 1) % rows;
+        if ((press[2] || press[3]) && sel < kCamCount) {
+            float v = vals[sel] + (press[3] ? 0.05f : -0.05f);
+            v = roundf(v * 20.f) / 20.f;
+            v = (std::max)(0.5f, (std::min)(1.8f, v));
+            if (v != vals[sel]) { vals[sel] = v; CamWrite(sel, v); }
+        }
+        if (press[4] && sel == kCamCount) {
+            for (int i = 0; i < kCamCount; ++i) { vals[i] = kCamItems[i].def; CamWrite(i, vals[i]); }
+            LOG("camera : champs de vision remis par defaut");
+        }
+        if (press[5]) {
+            g_camOpen = false;
+            LOG("camera : reglage ferme");
+            SetFlashNumber(movie, "_root.gtaCamOpen", 0);
+            return;
+        }
+    }
+    SetFlashNumber(movie, "_root.gtaCamOpen", 1);
+    SetFlashNumber(movie, "_root.gtaCamSel", sel);
+    SetFlashString(movie, "_root.gtaCamTitle", Tr("Camera", "Camera"));
+    SetFlashString(movie, "_root.gtaCamSub", Tr("Champ de vision par situation (100 % = jeu d'origine)",
+                                                "Field of view per situation (100 % = original game)"));
+    SetFlashString(movie, "_root.gtaCamHint", g_lastInputKbm.load()
+        ? Tr("Fleches haut / bas : choisir   gauche / droite : regler   Echap : retour", "Up / down: choose   left / right: adjust   Escape: back")
+        : Tr("Haut / bas : choisir   gauche / droite : regler   B : retour", "Up / down: choose   left / right: adjust   B: back"));
+    char path[32], row[96];
+    for (int i = 0; i < kCamCount; ++i) {
+        sprintf_s(path, "_root.gtaCamR%d", i);
+        sprintf_s(row, "%s|<  %d %%  >", Tr(kCamItems[i].fr, kCamItems[i].en), static_cast<int>(vals[i] * 100.f + 0.5f));
+        SetFlashString(movie, path, row);
+    }
+    sprintf_s(path, "_root.gtaCamR%d", kCamCount);
+    SetFlashString(movie, path, Tr("Valeurs par defaut|A", "Default values|A"));
+}
+
 // ---- Garde-robe : ligne « ARMES » -----------------------------------------------------------
 // Le Flash de la garde-robe (wardrobe.bin modifié) appelle ExternalInterface.call("GTA_ARM_HOVER", 0/1)
 // quand la ligne ARMES est surlignée. Les appels passent par UIGfxExternalInterface::Callback
@@ -3130,6 +3287,23 @@ void* g_wardrobeMovie = nullptr;
 
 void __fastcall HookExtCallback(void* self, void* movie, const char* method, uint8_t* args, uint32_t argc)
 {
+    if (method && strcmp(method, "GTA_CAM_TICK") == 0) {
+        double v = 0.0;
+        if (args && argc >= 1) {
+            const uint32_t type = *reinterpret_cast<uint32_t*>(args + 0x18) & 0x8F;
+            v = type == 5 ? *reinterpret_cast<double*>(args + 0x20) : type == 3 || type == 4 ? *reinterpret_cast<int32_t*>(args + 0x20) : 0.0;
+        }
+        UpdateCameraMenu(movie, v != 0.0);
+        return;
+    }
+    if (method && strcmp(method, "GTA_LOG") == 0 && movie != g_wardrobeMovie && args && argc >= 1) {
+        const uint32_t type = *reinterpret_cast<uint32_t*>(args + 0x18);
+        if ((type & 0x8F) == 6) {
+            const char* str = (type >> 6) & 1 ? **reinterpret_cast<const char***>(args + 0x20)
+                                              : *reinterpret_cast<const char**>(args + 0x20);
+            if (str && strncmp(str, "menu pause", 10) == 0) { LOG("flash : %s", str); return; }
+        }
+    }
     if (method && strncmp(method, "GTA_", 4) == 0) {
         g_wardrobeMovie = movie;
         if (strcmp(method, "GTA_LANG") == 0 && args && argc >= 1) {
@@ -3265,12 +3439,13 @@ LRESULT CALLBACK ModWndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp)
         }
         // Menu ARMES ouvert (ou sa ligne surlignée pour Entrée) : flèches, Entrée, Échap pour le mod
         // seulement, jusqu'au relâchement après la fermeture du menu.
-        if (msg != WM_CHAR && IsArmoryKey(wp) && (g_armOpen.load() || g_garOpen.load() || g_armKeysHeld.load() || (wp == VK_RETURN && ArmHoverActive()))) {
+        if (msg != WM_CHAR && IsArmoryKey(wp) && (g_armOpen.load() || g_garOpen.load() || g_camOpen.load() || g_armKeysHeld.load()
+                                                  || (wp == VK_RETURN && (ArmHoverActive() || CamHoverActive())))) {
             if (down) g_armKeysHeld = true;
-            else if (!g_armOpen.load() && !g_garOpen.load()) g_armKeysHeld = false;
+            else if (!g_armOpen.load() && !g_garOpen.load() && !g_camOpen.load()) g_armKeysHeld = false;
             return 0;
         }
-        if (msg == WM_CHAR && (wp == '\r' || wp == 27 || wp == 8) && (g_armOpen.load() || g_garOpen.load() || g_armKeysHeld.load())) return 0;
+        if (msg == WM_CHAR && (wp == '\r' || wp == 27 || wp == 8) && (g_armOpen.load() || g_garOpen.load() || g_camOpen.load() || g_armKeysHeld.load())) return 0;
         } else if (msg == WM_INPUT) {
         RAWINPUT ri{};
         UINT size = sizeof(ri);

@@ -1,7 +1,8 @@
 ﻿# Construit les écrans Flash modifiés et les injecte dans Sleeping Dogs (UI.big / UI.bix).
 #   - HUD façon GTA VI : script principal du HUD + ui\hud_gta.as
 #   - garde-robe avec la ligne ARMES : script principal de wardrobe.bin + ui\wardrobe_gta.as
-# Les deux sont injectés ensemble : ui_patch repart des archives d'origine à chaque application.
+#   - menu pause avec Options > Caméra : script principal de PauseMenu.bin + ui\pause_gta.as
+# Les trois sont injectés ensemble : ui_patch repart des archives d'origine à chaque application.
 param([switch]$Launch)
 $ErrorActionPreference = "Stop"
 $R    = Split-Path $PSScriptRoot   # racine du projet (dossier parent de tools_src)
@@ -28,7 +29,8 @@ function Build-Screen($name, $uid, $scriptRel, $addition) {
 
 $hud = Build-Screen "Hud" "4FAA1890" "frame_1\DoAction.as" "hud_gta.as"
 $wardrobe = Build-Screen "Wardrobe" "53ACE131" "frame_1\DoAction_2.as" "wardrobe_gta.as"
-python "$R\tools_src\ui_patch.py" apply $Game UI "4FAA1890=$hud" "53ACE131=$wardrobe"
+$pause = Build-Screen "PauseMenu" "FA6A0C87" "frame_1\DoAction.as" "pause_gta.as"
+python "$R\tools_src\ui_patch.py" apply $Game UI "4FAA1890=$hud" "53ACE131=$wardrobe" "FA6A0C87=$pause"
 if ($LASTEXITCODE -ne 0) { throw "injection echouee" }
 
 if ($Launch) { Start-Process "steam://rungameid/307690"; "jeu lance" }

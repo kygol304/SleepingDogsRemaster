@@ -25,6 +25,8 @@ weapons with their own 3D models.
   and a menu in the style of the game's shops. The tuning belongs to the vehicle you modified (cars and bikes)
 - **Nitro**: **A** / **N** while driving, flames out of the exhaust and a speed effect; speedometer next to the minimap
 - Minimap icons stay anchored to the streets
+- **Pause menu > Options > Camera**: field of view adjusted live for each situation (on foot, weapon drawn,
+  aiming, melee combat, car, bike, boat, aiming from a vehicle)
 - French / English texts, following the game language
 
 ## Controls
@@ -82,6 +84,21 @@ Scales are multipliers of the original game value: `1.0` = original, `1.2` = 20 
 | `FovScale` | `1.15` | Field of view in vehicles |
 | `DistanceScale` | `1.08` | Distance behind the vehicle |
 | `Height` | `-0.15` | Height offset in meters |
+
+### `[CameraFov]` - field of view per situation
+
+Also adjustable live in the game: **pause menu > Options > Camera** (up / down to choose, left / right
+to adjust, 100 % = original game).
+
+| Key | Default | Effect |
+|---|---|---|
+| `Armed` | `1.2` | Weapon drawn (walking / sprinting with a gun) |
+| `Aim` | `1.0` | Aiming (shoulder, phone, sniper) |
+| `Bike` | `1.15` | Bikes and scooters |
+| `Boat` | `1.15` | Boats |
+| `VehicleAim` | `1.0` | Aiming from a vehicle |
+
+On foot, melee combat and car use `[Camera] FovScale`, `[Combat] FovScale` and `[Vehicle] FovScale`.
 
 ### `[Minimap]`
 
@@ -212,15 +229,15 @@ safehouse.
 | File | Purpose |
 |---|---|
 | `dinput8.dll` | The mod. Loaded by the game from its folder; forwards `DirectInput8Create` to the real `System32\dinput8.dll`, then patches functions of `sdhdship.exe` **in memory, inside the game process only**. No network access; it only reads/writes `SleepingDogsRemaster.ini` / `.log` and reads its own `SleepingDogsRemaster\` folder (models, icons). |
-| `SleepingDogsRemaster-Installer.exe` | Copies the files to the game folder, backs up `UI.bix` and the size of `UI.big`, then appends the modified HUD / wardrobe screens to `UI.big` and updates their `UI.bix` entries. Choice 2 restores the original files and removes the mod. |
+| `SleepingDogsRemaster-Installer.exe` | Copies the files to the game folder, backs up `UI.bix` and the size of `UI.big`, then appends the modified HUD / wardrobe / pause menu screens to `UI.big` and updates their `UI.bix` entries. Choice 2 restores the original files and removes the mod. |
 
 ## Repository layout
 
 | Folder | Content |
 |---|---|
-| `sd_remaster/` | The mod (`dinput8.dll`): `src/dllmain.cpp`, `src/newweapons.cpp` (runtime 3D models, textures, icons, rocket launcher), `src/graphics.cpp` (bloom / sky tuning) |
+| `sd_remaster/` | The mod (`dinput8.dll`): `src/dllmain.cpp`, `src/newweapons.cpp` (runtime 3D models, textures, icons, rocket launcher), `src/graphics.cpp` (bloom / sky tuning), `src/driving.cpp` (driving, tuning, paint, nitro flames) |
 | `installer/` | The installer (`installer.cpp`) |
-| `ui/` | ActionScript added to the game's HUD and wardrobe Flash screens |
+| `ui/` | ActionScript added to the game's HUD, wardrobe and pause menu Flash screens |
 | `tools_src/` | Build tools: UI screens (`build_hud.ps1`, `ui_patch.py`, `ui_wrap.py`), `weapons3d/` (Blender scripts converting the glTF models and rendering the icons) |
 | `ghidra_scripts/` | Ghidra scripts used to study the game executable |
 
@@ -247,7 +264,7 @@ cmake --build build-installer --config Release
 
 Output: `build-mod/Release/dinput8.dll` and `build-installer/Release/SleepingDogsRemaster-Installer.exe`.
 
-The HUD / wardrobe screens (`Hud.bin`, `Wardrobe.bin`) are the game's own Flash screens with the
+The HUD / wardrobe / pause menu screens (`Hud.bin`, `Wardrobe.bin`, `PauseMenu.bin`) are the game's own Flash screens with the
 scripts from `ui/` added, rebuilt by `tools_src/build_hud.ps1` (needs JPEXS Free Flash Decompiler and
 the screens extracted from the game). The weapon models (`.skm`) are produced by
 `tools_src/weapons3d/import_models.py` (Blender) from the Sketchfab models credited below.

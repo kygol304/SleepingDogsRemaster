@@ -29,6 +29,7 @@ struct Screen { uint32_t uid; const char* file; };
 const Screen kScreens[] = {
     { 0x4FAA1890, "Hud.bin" },        // Data\UI\Screens\Hud.bin
     { 0x53ACE131, "Wardrobe.bin" },   // Data\UI\Screens\wardrobe.bin
+    { 0xFA6A0C87, "PauseMenu.bin" },  // Data\UI\Screens\PauseMenu.bin
 };
 
 void Say(const char* fr, const char* en)
